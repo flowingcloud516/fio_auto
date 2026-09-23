@@ -25,7 +25,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 DISK_RANGE_PERCENT = 84
 CASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
                 "cpu_start", "cpu_end", "runtime_s", "rwmixread", "notes")
@@ -536,6 +536,21 @@ def execute(command, cwd, output, timeout, progress=None):
             raise
 
 
+def extract_fio_json(combined_path, json_path):
+    """Extract fio's JSON object from a combined normal,json output stream."""
+    text = combined_path.read_text(encoding="utf-8", errors="replace")
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("jobs"), list):
+            write_json(json_path, value)
+            return value
+    fail(f"fio completed but no JSON result was found in {combined_path}")
+
+
 def run_suite(plans, root, fio, timeout_grace, devices, progress):
     records = []
     for index, plan in enumerate(plans, 1):
@@ -579,7 +594,7 @@ def run_suite(plans, root, fio, timeout_grace, devices, progress):
                 fail("Device identity, capacity or sector size changed since preflight")
             check_device_idle(device)
             check_cpus([plan])
-            command = [fio, "--output-format=normal", "--eta=never"]
+            command = [fio, "--output-format=normal,json", "--eta=never"]
             if not plan["writes"]:
                 command.append("--readonly")
             command.append("jobs.fio")
@@ -594,6 +609,7 @@ def run_suite(plans, root, fio, timeout_grace, devices, progress):
                 save_error(folder, info, "timeout" if timed_out else "failed", error, code)
                 progress.state["error"] = error
                 return 1
+            extract_fio_json(folder / "result.txt", folder / "result.json")
             info.update(status="passed", exit_code=code, finished_at=stamp())
             write_json(folder / "run_info.json", info)
             progress.step("CASE_DONE", f"Case passed; result={folder / 'result.txt'}", index, plan["case_id"])

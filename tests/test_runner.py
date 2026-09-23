@@ -447,6 +447,7 @@ class RunnerTests(unittest.TestCase):
         plans = self.prepare_suite()
         progress = self.new_progress()
         with patch.object(runner,"execute",side_effect=[(0,False),(0,False),(0,False),(9,False)]), \
+             patch.object(runner,"extract_fio_json",return_value={}), \
              patch.object(runner,"probe_device",return_value={"path":"/dev/test"}), \
              patch.object(runner,"check_device_idle"), patch.object(runner,"check_cpus"):
             code = runner.run_suite(plans,self.root,"fio",60,{"/dev/test":{"path":"/dev/test"}},progress)

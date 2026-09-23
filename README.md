@@ -201,7 +201,8 @@ fio_results/
       cpu_mapping.csv             # 预期实例到 CPU 的对应关系
       run_info.json               # 用例序号、配置、状态、命令、退出码、失败阶段/原因和时间
       parse_check.txt             # fio --parse-only 的输出
-      result.txt                  # fio 原生 plain text，包含标准输出和错误输出
+      result.txt                  # fio 原生 normal + JSON 组合输出，完整保留原始 stdout/stderr
+      result.json                 # 从同一次 fio 运行提取的结构化结果，供统计工具读取
     002_randread_4k/
       ...
 ```
@@ -226,7 +227,29 @@ fio_results/
 
 记录的阶段包括 `STARTUP`、`CONFIG_READ`、`SELECT`、`CPU_CHECK`、`DEVICE_CHECK`、`PLAN_GENERATE`、`WRITE_GUARD`、`FIO_CHECK`、`ARCHIVE`、`DEVICE_LOCK`、`PREFLIGHT`、`CASE_RECHECK`、`CASE_RUN`、`CASE_DONE`；预览完成时为 `PREVIEW_DONE`。设备、容量、CPU/区域规划阶段、实际命令、子进程 PID、日志路径、退出码和中止信号都有记录。Python 异常保留 traceback。
 
-fio 子进程等待期间每 10 秒输出一条存活等待日志，不读取或解析性能结果。fio 原生输出仍只写入该用例的 `result.txt`，不会混入主流程日志。
+fio 子进程等待期间每 10 秒输出一条存活等待日志。fio 使用 `--output-format=normal,json` 一次运行同时输出普通文本和 JSON；完整原始输出写入 `result.txt`，其中的 JSON 对象另存为 `result.json`，不会重复执行负载。
+
+## 结果统计
+
+统计工具会递归扫描结果根目录下的所有 `run_info.json`，以当前设计 Excel 的 `case_id` 和有效配置进行对照：
+
+```bash
+python3.11 fio_result_report.py \
+  --excel 示例.xlsx \
+  --results ./fio_results \
+  --output 统计结果.xlsx
+```
+
+报表包含 `统计概览`、`用例覆盖`、`运行明细` 和 `异常清单`。`用例覆盖` 以当前 Excel 为准，显示最新匹配结果、实际执行次数、成功次数，以及读写 IOPS、带宽、完成延迟、运行时间和 CPU 汇总指标。`运行明细` 保留扫描到的全部历史记录。
+
+以下规则用于判断覆盖情况：
+
+- `passed`、`failed`、`timeout`、`interrupted`、`error` 计入实际执行次数；dry-run 的 `planned` 不计入。
+- 相同 `case_id` 的设备、CPU 范围、运行时间或任一 job 参数发生变化时，旧记录保留在运行明细，但当前配置标记为“配置已变更”，仍需重新执行。
+- `enabled=0` 标记为“已禁用”；没有任何归档的启用用例标记为“从未执行”。
+- 新版本归档从 `result.json` 读取性能数据。旧归档只有 `result.txt` 时会兼容解析常见 fio normal 输出；无法可靠识别的字段保持空白，并在异常清单中说明。
+
+统计结果是用例级汇总。由于 job 文件固定使用 `group_reporting=1`，不输出实例级或独立 job 级性能表。
 
 可用以下命令跟踪进度，把目录替换成这次运行实际输出的归档目录：
 
