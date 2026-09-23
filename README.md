@@ -251,6 +251,32 @@ python3.11 fio_result_report.py \
 
 统计结果是用例级汇总。由于 job 文件固定使用 `group_reporting=1`，不输出实例级或独立 job 级性能表。
 
+## 笛卡尔积用例生成
+
+`fio_case_generator.py` 根据参数列表生成可直接交给 runner 的 Excel。下面的命令会生成 `3 × 3 × 4 = 36` 个用例：
+
+```bash
+python3.11 fio_case_generator.py \
+  --rw read,write,randread \
+  --bs 8K,128K,1M \
+  --iodepth 1,2,4,8 \
+  --device /dev/nvme1n1 \
+  --cpu-start 2 --cpu-end 17 \
+  --output 生成用例.xlsx
+```
+
+默认值为 `jobs=1`、`numjobs=1`、`runtime=60`。这三个参数也可以传入逗号分隔列表，加入笛卡尔积：
+
+```bash
+python3.11 fio_case_generator.py \
+  --rw randread,randwrite --bs 4K,128K --iodepth 1,32 \
+  --jobs 1,2 --numjobs 1,4 --runtime 30,60 \
+  --device /dev/nvme1n1 --cpu-start 0 --cpu-end 15 \
+  --case-prefix perf --output 生成用例.xlsx
+```
+
+生成器输出 `Cases` 和空的 `JobOverrides` 两个 sheet，并在写入后调用 runner 自己的 Excel 解析器做一次完整校验。默认最多生成 10000 个用例，可用 `--max-cases` 调整保护上限。对于 `rw`/`randrw`，可用 `--rwmixread` 指定读比例。
+
 可用以下命令跟踪进度，把目录替换成这次运行实际输出的归档目录：
 
 ```bash
