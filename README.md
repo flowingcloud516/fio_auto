@@ -1,0 +1,294 @@
+# fio Excel 自动化运行工具
+
+面向 Linux，兼容 Python 3.11.6。脚本只使用 Python 标准库，直接读取 `.xlsx`，无需安装 openpyxl、pandas 或其他 Python 包。系统需要安装 **Flexible I/O Tester（fio）**，且该 fio 构建支持 `libaio`。
+
+当前版本完成配置、生成和运行，不解析性能结果。最终性能输出是 fio 原生 plain text。
+
+v1.4.0 新增主流程日志和当前用例进度记录；任一错误立即终止整批任务，不再支持出错后继续。
+
+`examples/example_jobs.fio` 展示 4 个独立 job、每个 numjobs=2 的完整配置。它以假设的 1 TB 设备和 CPU 2–17 为例，仅供查看结构；实际运行由脚本读取设备容量后重新生成。`examples/example_two_jobs.fio` 使用假设的 100 GiB 设备，展示可以精确对齐时的 `size=42%`、`offset=42%` 写法。
+
+## 快速使用
+
+1. 克隆本仓库到 Linux 测试机。
+2. 打开 `示例.xlsx`，修改 `Cases` 中的 `device`、`cpu_start`、`cpu_end` 和测试参数，保存为 `.xlsx`。
+3. `device` 填 Linux 设备完整路径，例如 `/dev/nvme1n1` 或 `/dev/sdb`。示例中的盘符必须替换为你的实际测试设备。
+4. 将 `--output` 放在测试设备之外的文件系统。
+
+预览配置，不启动 fio 负载：
+
+```bash
+sudo python3.11 fio_excel_runner.py \
+  --excel 示例.xlsx \
+  --output ./fio_results \
+  --dry-run
+```
+
+确认生成的 `jobs.fio` 和 `cpu_mapping.csv` 后正式运行：
+
+```bash
+sudo python3.11 fio_excel_runner.py \
+  --excel 示例.xlsx \
+  --output ./fio_results
+```
+
+示例默认只启用两个读用例，各运行 60 秒。若启用写入或混合读写用例，执行时加 `--allow-write`。写入会破坏目标设备前 84% 内的原有数据，包括可能位于开头的分区表；脚本不会自动卸载、格式化或清空磁盘。
+
+```bash
+sudo python3.11 fio_excel_runner.py \
+  --excel 示例.xlsx \
+  --output ./fio_results \
+  --allow-write
+```
+
+若你的解释器命令是 `python3`，先用 `python3 --version` 确认版本，再替换示例命令。`sudo` 下也必须能找到这个解释器。
+
+## Excel 填写方法
+
+### Cases：每行一个用例
+
+| 字段 | 含义 |
+|---|---|
+| case_id | 用例唯一标识，1–64 位英文字母、数字、下划线或短横线，以字母或数字开头 |
+| enabled | `1` 运行、`0` 跳过；留空默认 `1` |
+| device | 目标设备完整路径，如 `/dev/nvme1n1`、`/dev/sdb`；同一用例的所有 job 使用此设备 |
+| rw | `read`、`write`、`randread`、`randwrite`、`rw`、`randrw` |
+| bs | 一个固定块大小，如 `4k`、`128k`、`1m` 或字节数 `4096` |
+| iodepth | 每个工作实例的队列深度，正整数 |
+| jobs | 独立 job 配置段数量，生成 `[job_001]`、`[job_002]` 等 |
+| numjobs | 每个独立 job 默认启动多少个实例，可单独覆盖 |
+| cpu_start | Linux 逻辑 CPU 编号起点，包含本编号 |
+| cpu_end | Linux 逻辑 CPU 编号终点，包含本编号，不小于起点 |
+| runtime_s | 用例运行秒数，正整数，留空默认 `60` |
+| rwmixread | 仅 `rw`/`randrw` 使用，读比例 0–100，留空默认 `50`；纯读/纯写留空 |
+| notes | 备注，不传给 fio |
+
+`bs` 的 k/m/g 按 1024 换算；生成 job 文件时写为明确的字节数。第一版不支持 `bssplit`、块大小范围或在一个单元格填参数列表。要比较参数，请复制成多行用例。
+
+盘符优先级：命令行 `--device` > Excel 当前行 `device`。不传 `--device` 时直接使用 Excel；Excel 留空且命令行未指定时会报错。填写不同设备的用例仍串行运行，并分别读取对应设备容量来计算前 84%。`run_info.json` 记录 Excel 原值、最终设备和来源，生成的 `jobs.fio` 使用最终设备作为 `filename`。
+
+例如临时把所有选中用例统一改测 `/dev/sdb`：
+
+```bash
+sudo python3.11 fio_excel_runner.py --excel 示例.xlsx --device /dev/sdb --dry-run
+```
+
+旧版 Excel 需在 Cases 添加名为 `device` 的列，或直接使用本次更新的示例。
+
+### JobOverrides：单独配置某个 job
+
+用 `case_id` 和 `job_index` 指定要覆盖的 job。`job_index` 从 1 开始，不超过该用例的 `jobs`。可覆盖 `rw`、`bs`、`iodepth`、`numjobs`、`rwmixread`，空白继承 Cases。
+
+例如示例中的 `custom_jobs` 生成两个配置段：
+
+- `job_001`：`read`、128 KiB、iodepth 16、numjobs 1。
+- `job_002`：`randwrite`、4 KiB、iodepth 32、numjobs 3。
+
+该用例共 4 个实例，实际数量为各 job 的 `numjobs` 之和。启用它时，在 Cases 中把 `enabled` 改为 `1`，并为执行添加 `--allow-write`。
+
+`JobOverrides` 可以只保留表头，也可以删除整个工作表。`Guide` 是填写说明，脚本不会读取它。
+
+### 输入约束
+
+- 保持 `Cases`、`JobOverrides` 工作表名称及第 1 行英文字段名不变，字段列顺序可以调整。
+- 新用例直接往下添加；脚本按实际非空行读取，不依赖 Excel Table 的原有边界。
+- 不要在配置表右侧添加其他列或文字；备注填入 `notes`，其他说明放到 `Guide`。
+- 使用固定值，不支持公式。公式即使带 Excel 缓存结果也会被拒绝，避免读取旧值。
+- 支持 Excel 的 shared strings、inline strings、数字单元格，以及空白的格式化行。
+- 仅支持普通、未加密的 `.xlsx`，不支持 `.xls`、`.xlsm`、日期型输入或合并的配置单元格。
+- 禁用行仍检查配置格式；CPU 是否可用只检查本次启用并选中的用例。
+- 重复用例 ID、重复 job 覆盖、未知字段、缺失必要值和非法参数都会报错。
+
+## 运行和绑核约定
+
+不同用例按 Excel 行顺序串行运行，包括指向不同设备的用例。每个用例只启动一次 fio，文件中的所有独立 job 和它们的 `numjobs` 实例同时运行，没有 `stonewall`。
+
+CPU 参数是 Linux **逻辑 CPU ID**，不是去除 SMT 后的物理 core 编号。可以在机器上用 `lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE` 检查编号。
+
+**每个独立 job 单独分配恰好 numjobs 个连续 CPU**，不再给所有 job 使用同一个全局 CPU 列表。例如该 job 的起始 CPU 是 251：
+
+```ini
+; numjobs=1 时
+numjobs=1
+cpus_allowed=251
+cpus_allowed_policy=split
+
+; numjobs=4 时
+numjobs=4
+cpus_allowed=251-254
+cpus_allowed_policy=split
+```
+
+`cpus_allowed_policy=split` 保留，保证同一个 job 的每个实例各绑定区间内的一个 CPU，不在整个区间内自由迁移。
+
+设输入闭区间有 C 个 CPU，各 job 的实例数为 n1、n2…，合计 W：
+
+- 每个 n 必须不超过 C；单个 job 要 4 个核而输入范围只有 3 个核时，报错。
+- `W <= C`：各 job 的连续 CPU 区间互不重叠，多余的核均匀留在 job 区间之间，让这些区间分散在输入范围内。只有一个 job 时，从 `cpu_start` 开始分配。
+- `W > C`：允许不同 job 复用 CPU 区间，按已分配实例负载选择连续区间，尽量均衡。每个 job 的区间仍连续且长度等于其 numjobs，不越界、不首尾绕回。连续区间约束下不保证每核实例数之差不超过 1。
+
+例如 CPU `2..17`、4 个 job、每个 numjobs=2，分配为 `2-3`、`6-7`、`11-12`、`16-17`。逐 job 配置的 numjobs 不同时，也分别按各自数量分配连续区间。分配结果保存在 `run_info.json` 的 `cpu_assignments`。
+
+fio 的 split 仍按全局实例序号在该 job 的区间内取模。因此不同 numjobs 的 job 中，clone 0 不一定从区间第一个核开始，但同一个 job 的所有克隆恰好覆盖该 job 的全部分配核。
+
+`cpu_mapping.csv` 是基于 fio split 规则生成的**预期分配**，不是运行时采样结果。当前版本不采集实际 CPU 调度轨迹，不修改 IRQ 亲和性，也不承诺各核 CPU 使用率或 IOPS 相同。按 CPU 编号分散 job 区间并不等价于按 NUMA 或物理核拓扑分散。
+
+整个输入闭区间必须在线且属于当前进程可用的 affinity/cpuset；不符合时明确报错，不会静默缩小范围。
+
+## 磁盘范围与固定参数
+
+**正式运行根据每个用例对应设备的实际容量计算，非固定容量。**前 84% 按独立 job 数量均分，各 job 访问的空间互不重叠；同一个 job 的 `numjobs` 克隆实例共享该 job 的区域。均分按独立 job 数量，不按 numjobs 加权。
+
+两个 job 的目标范围是 `[0%, 42%)` 和 `[42%, 84%)`。结束地址不包含在该区域内，因此边界不会重复，也不需要从 43% 开始留下 1% 空隙。四个 job 则分别为 `[0%, 21%)`、`[21%, 42%)`、`[42%, 63%)`、`[63%, 84%)`。实际边界会按块对齐稍微向下调整。
+
+脚本读取实际目标设备容量 D（字节），对于 N 个独立 job 计算：
+
+```text
+limit = floor(D × 84 / 100)
+alignment = lcm(逻辑扇区大小, 本用例所有 job 的 bs)
+units = floor(limit / alignment)
+总区域大小 = units × alignment
+第 i 个 job（i 从 0 开始）：
+  offset = floor(units × i / N) × alignment
+  end = floor(units × (i + 1) / N) × alignment
+  size = end - offset
+  访问区间 = [offset, end)，最后允许的字节地址是 end - 1
+```
+
+`offset` 和 `size` 写在各自的 `[job_xxx]` 下，不再放在 `[global]`。不设置 `offset_increment`，所以 `numjobs` 克隆不继续向后移动；增加 `jobs` 会重新均分区域。不同 job 的分区大小最多相差一个公共对齐单位。区域太小、无法给每个 job 分配至少一个对齐单位时直接报错。
+
+**可以使用 `size=84%`。**fio 支持百分比大小，表示设备容量的相应比例，而不是结束地址。当前生成规则：
+
+- 只有一个独立 job：输出 `offset=0`、`size=84%`；元数据记录 fio 向下块对齐后的实际字节边界。
+- 多个独立 job：当 `84 / jobs` 为整数且所有边界都能精确对齐时，输出百分比，例如 `offset=42%`、`size=42%`。
+- 其他情况：输出校验后的字节 offset/size，并附带 `Nominal disk range: [0%, 42%)` 和实际字节范围注释，保持可读性。
+
+采用这个规则是因为 fio 百分比 offset 会向上对齐，而百分比 size 会向下对齐；直接拼接并不能对所有盘容量、块大小和 job 数量保证边界一致。比如 5 个 job 的理想长度是 16.8%，也不适合使用 fio 的整数百分比参数。脚本在这些情况下使用精确字节值，确保不重叠且不超过 84%。参见 [fio 的 size/offset 定义](https://fio.readthedocs.io/en/latest/fio_doc.html)。
+
+每个 job 的计算结果保存在 `run_info.json` 的 `job_regions` 中，包括字节起点、长度、排他结束地址、名义百分比范围和实际 fio 参数。这个记录是生成配置的边界核算，不是运行时 I/O 跟踪。
+
+总传输量可以因 `time_based` 循环运行而超过磁盘容量，这不表示访问地址越界。范围相对于本用例最终选定的设备计算；要测试整盘，请填整盘节点而不是某个分区。
+
+以下参数固定，Excel 无法覆盖：
+
+```ini
+direct=1
+ioengine=libaio
+group_reporting=1
+norandommap=1
+randrepeat=0
+ramp_time=0
+time_based=1
+```
+
+其中 `norandommap=1` 和 `time_based=1` 分别等价于启用你要求的 `norandommap`、`time_based`。
+
+另外固定 `allow_file_create=0`、`exitall_on_error=1`：不创建目标文件；一个 job 出错时停止本用例的其余 job。纯读用例额外使用 fio 的 `--readonly`。
+
+## 输出归档
+
+每次调用创建新的时间戳＋随机后缀目录，不覆盖旧结果：
+
+```text
+fio_results/
+  20260922_210000_a1b2c3d4/
+    runner.log                    # 主流程日志，与终端输出同步
+    run_status.json               # 整批状态、当前阶段/用例序号、最终状态计数
+    input.xlsx                    # 本次输入副本
+    environment.json              # Python/fio 版本和实际设备信息
+    001_seq_read_1m/
+      jobs.fio                    # 完整 fio job 描述文件
+      cpu_mapping.csv             # 预期实例到 CPU 的对应关系
+      run_info.json               # 用例序号、配置、状态、命令、退出码、失败阶段/原因和时间
+      parse_check.txt             # fio --parse-only 的输出
+      result.txt                  # fio 原生 plain text，包含标准输出和错误输出
+    002_randread_4k/
+      ...
+```
+
+不启用每笔 I/O、BW、IOPS 或延迟时间序列日志。`group_reporting=1` 按你的要求保留，因此 plain text 中以 fio 分组汇总为准；不额外生成实例级性能报告。
+
+`--dry-run` 只产生配置和元数据，不生成 `result.txt`/`parse_check.txt`，也不调用 fio。正式运行前，对所有选中用例做 fio `--parse-only` 检查，全部通过后才开始负载。
+
+## 主流程日志和排查
+
+`runner.log` 在读取 Excel 之前创建，每条日志带 UTC 时间、级别、阶段和用例位置，并同步输出到终端。例如：
+
+```text
+2026-09-22T14:00:00Z INFO [CONFIG_READ][suite] Reading Excel: /data/示例.xlsx
+2026-09-22T14:00:01Z INFO [SELECT][suite] Selected 5 cases in worksheet order
+2026-09-22T14:01:02Z INFO [CASE_RUN][case 2/5 id=randread_4k] Starting case; device=/dev/nvme1n1; workers=8; runtime=60s
+2026-09-22T14:01:02Z INFO [CASE_RUN][case 2/5 id=randread_4k] Process started: pid=12345
+2026-09-22T14:01:12Z INFO [CASE_RUN][case 2/5 id=randread_4k] Process running: pid=12345; elapsed=10.0s
+```
+
+这里的 `2/5` 表示本次选中的第 2 个用例、共 5 个，不包含禁用或未被 `--case` 选中的行。示例日志仅说明格式。
+
+记录的阶段包括 `STARTUP`、`CONFIG_READ`、`SELECT`、`CPU_CHECK`、`DEVICE_CHECK`、`PLAN_GENERATE`、`WRITE_GUARD`、`FIO_CHECK`、`ARCHIVE`、`DEVICE_LOCK`、`PREFLIGHT`、`CASE_RECHECK`、`CASE_RUN`、`CASE_DONE`；预览完成时为 `PREVIEW_DONE`。设备、容量、CPU/区域规划阶段、实际命令、子进程 PID、日志路径、退出码和中止信号都有记录。Python 异常保留 traceback。
+
+fio 子进程等待期间每 10 秒输出一条存活等待日志，不读取或解析性能结果。fio 原生输出仍只写入该用例的 `result.txt`，不会混入主流程日志。
+
+可用以下命令跟踪进度，把目录替换成这次运行实际输出的归档目录：
+
+```bash
+tail -f fio_results/本次运行目录/runner.log
+cat fio_results/本次运行目录/run_status.json
+```
+
+`run_status.json` 的 `stage`、`case_index`、`case_count`、`case_id` 表示当前阶段和用例。整批结束时还包含 `status`、`exit_code`、`finished_at`、各用例最终状态和 `counts`；失败时保留出错阶段、用例位置及 `error`。单个用例详情在各自的 `run_info.json` 中。
+
+日志目录在配置校验前创建，所以 Excel 缺失、内容错误、设备检查失败也会留下日志。命令行参数解析错误，或输出目录/日志文件本身无法创建时，只能在终端报告。
+
+## 其他命令
+
+只运行指定的启用用例，可重复使用 `--case`：
+
+```bash
+sudo python3.11 fio_excel_runner.py --excel 示例.xlsx \
+  --case randread_4k --output ./fio_results
+```
+
+**任一错误立即终止整批任务。**包括 fio 非零退出、超时、预检失败、设备/CPU 检查失败、启动子进程失败和 Python 异常。`--continue-on-error` 已移除，旧命令若仍携带此参数会直接报参数错误。
+
+出错用例记录为 `failed`、`timeout`、`preflight_failed` 或 `error`，已完成用例保留原状态；尚未运行的用例标记为 `skipped` 并写入原因，不会自动重试或启动后续用例。如果是在全部用例的预检阶段失败，则所有负载都不启动，其他用例标记为 `skipped`。中断时当前用例记为 `interrupted`，其余未运行用例也标记为 `skipped`。
+
+默认 watchdog 上限为 `runtime_s + 60` 秒，包括 fio 启动开销。可以用 `--timeout-grace 120` 调整额外时间。超时和 Ctrl+C 会先通知 fio 结束并等待报告落盘，再逐级终止；若必须强制杀死，`result.txt` 可能只含部分输出，状态会注明超时或中断。
+
+没有连接测试设备时，可以离线预览（Windows/Linux 均可）：
+
+```bash
+python3.11 fio_excel_runner.py --excel 示例.xlsx \
+  --dry-run \
+  --device-size-bytes 1000000000000 --logical-sector-bytes 512 \
+  --output ./preview_results
+```
+
+离线容量只允许配合 `--dry-run`，对所有选中设备使用同一个假设容量；正式运行一定分别读取实际设备容量。离线预览不验证设备存在性、CPU 在线情况或 fio 能力。
+
+可以用 `--fio /usr/local/bin/fio` 指定 fio 可执行文件。
+
+退出码：`0` 全部成功或预览成功；`1` fio 用例失败/超时；`2` 配置或运行环境错误；`130` 用户中断。
+
+## 设备检查和使用边界
+
+执行前检查目标是否为块设备，并拒绝已挂载的设备/子分区、活动 swap、带 device-mapper/RAID holder 的设备和 host-managed zoned 设备。每个用例开始前重新检查设备身份、容量、扇区大小和 CPU 可用范围。
+
+同一设备的两个本工具实例通过 `/run/lock` 锁互斥。该锁不阻止其他软件访问磁盘；应在专用空闲测试盘上运行，也不要在运行期间重新挂载设备。挂载检查以当前 Linux mount namespace 为准，推荐直接在测试主机上运行。
+
+## 已完成的验证
+
+仓库的 `tests/test_runner.py` 包含自动测试，可运行：
+
+```bash
+python3.11 -B -m unittest discover -s tests -v
+```
+
+本次在 Windows / Python 3.12.14 环境完成 39 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、缺失/非法盘符、逐设备容量计算、默认值和 job 覆盖、逐 job 连续 CPU 区间、251-254 示例、不同 numjobs 下的克隆映射、CPU 不足检查、84% 字节边界、独立 job 区域隔离、百分比/字节参数切换、numjobs 共享本 job 空间、固定参数、错误输入、离线 CLI、子进程输出/超时及失败/中断状态。新增验证覆盖早期 Excel 失败日志、主流程阶段及用例序号、PID/定时等待日志、首个错误即终止、已完成结果保留、剩余用例跳过、预检启动失败和归档失败状态。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
+
+三张工作表已渲染检查。尚未在 Python 3.11.6 本机或 Linux/libaio/真实块设备上执行集成测试；目标机正式运行会先进行 fio 参数解析检查。请先在目标机把一个只读用例改为短时长进行环境验证。
+
+## fio 依据
+
+- [fio 官方文档：job 文件、numjobs、范围和日志](https://fio.readthedocs.io/en/latest/fio_doc.html)
+- [fio backend.c：split 使用全局 thread_number - 1](https://github.com/axboe/fio/blob/master/backend.c)
+- [fio options.c：fio_cpus_split 按 CPU 数取模](https://github.com/axboe/fio/blob/master/options.c)

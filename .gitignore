@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+fio_results/
+preview_results/
+*.log
