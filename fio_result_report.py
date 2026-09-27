@@ -214,10 +214,23 @@ METRIC_KEYS = [
 
 def overview_row(case, latest, status, reason, run_count, pass_count, history_count):
     source = case.get("source_values", {})
+    def compact(key, formatter=lambda value: value):
+        values = {job.get(key) for job in case["job_list"]}
+        if len(values) == 1:
+            value = next(iter(values))
+            return "" if value is None else formatter(value)
+        return "多值（见Job配置）"
+
+    def readable_bs(value):
+        for suffix, unit in (("G", 1024**3), ("M", 1024**2), ("K", 1024)):
+            if value % unit == 0:
+                return f"{value // unit}{suffix}"
+        return value
+
     config = [case["case_id"], 1 if case["enabled"] else 0, case.get("requested_device", ""),
-              source.get("rw", ""), source.get("bs", ""), source.get("iodepth", ""), case["jobs"],
-              source.get("numjobs", ""), case["cpu_start"], case["cpu_end"], case.get("runtime_s"),
-              source.get("rwmixread", ""), source.get("notes", ""),
+              compact("rw"), compact("bs_bytes", readable_bs), compact("iodepth"), case["jobs"],
+              compact("numjobs"), case["cpu_start"], case["cpu_end"], case.get("runtime_s"),
+              compact("rwmixread"), source.get("notes", ""),
               1 if case.get("time_based", True) else 0, case.get("timeout_s")]
     values = config + [STATUS_CN.get(status, status), reason, run_count, pass_count, history_count,
                        latest.get("batch", "") if latest else "",

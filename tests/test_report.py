@@ -67,10 +67,21 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report.OVERVIEW_HEADERS[:len(runner.CASE_COLUMNS)], list(runner.CASE_COLUMNS))
         row = dict(zip(report.OVERVIEW_HEADERS, overview[0]))
         self.assertEqual(row["rw"], "read")
-        self.assertEqual(row["bs"], "1m")
-        self.assertEqual(row["iodepth"], "32")
+        self.assertEqual(row["bs"], "1M")
+        self.assertEqual(row["iodepth"], 32)
         self.assertEqual(row["jobs"], 1)
         self.assertEqual(jobs[0][report.JOB_HEADERS.index("rw")], "read")
+
+        repeated = dict(zip(report.OVERVIEW_HEADERS, overview[1]))
+        self.assertEqual(repeated["rw"], "randread")
+        self.assertEqual(repeated["bs"], "4K")
+        self.assertEqual(repeated["iodepth"], 32)
+        self.assertEqual(repeated["numjobs"], 2)
+
+        custom_index = next(i for i, case in enumerate(cases) if case["case_id"] == "custom_jobs")
+        custom = dict(zip(report.OVERVIEW_HEADERS, overview[custom_index]))
+        self.assertEqual(custom["rw"], "多值（见Job配置）")
+        self.assertEqual(custom["bs"], "多值（见Job配置）")
 
     def test_combined_output_json_extraction(self):
         source = self.root / "result.txt"
