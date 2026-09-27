@@ -46,6 +46,24 @@ class GeneratorTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.ConfigError, "CPU range size"):
             generator.main(self.base() + ["--numjobs", "17", "--output", str(self.root/"y.xlsx")])
 
+    def test_non_time_based_generation(self):
+        output = self.root / "full.xlsx"
+        argv = ["--rw", "write", "--bs", "1M", "--iodepth", "32",
+                "--device", "/dev/nvme1n1", "--cpu-start", "2", "--cpu-end", "17",
+                "--time-based", "0", "--timeout", "7200", "--output", str(output)]
+        generator.main(argv)
+        case = runner.load_cases(output)[0]
+        self.assertFalse(case["time_based"])
+        self.assertIsNone(case["runtime_s"])
+        self.assertEqual(case["timeout_s"], 7200)
+        plan = runner.make_plan(case, "/dev/nvme1n1", 10**12, 512)
+        self.assertNotIn("time_based=", plan["fio_text"])
+        self.assertNotIn("runtime=", plan["fio_text"])
+
+    def test_non_time_based_requires_timeout(self):
+        with self.assertRaisesRegex(runner.ConfigError, "--timeout is required"):
+            generator.main(self.base() + ["--time-based", "0", "--output", str(self.root/"x.xlsx")])
+
 
 if __name__ == "__main__":
     unittest.main()

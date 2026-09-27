@@ -59,9 +59,11 @@ sudo python3.11 fio_excel_runner.py \
 | numjobs | 每个独立 job 默认启动多少个实例，可单独覆盖 |
 | cpu_start | Linux 逻辑 CPU 编号起点，包含本编号 |
 | cpu_end | Linux 逻辑 CPU 编号终点，包含本编号，不小于起点 |
-| runtime_s | 用例运行秒数，正整数，留空默认 `60` |
+| runtime_s | `time_based=1` 时的运行秒数，正整数，留空默认 `60`；`time_based=0` 时必须留空 |
 | rwmixread | 仅 `rw`/`randrw` 使用，读比例 0–100，留空默认 `50`；纯读/纯写留空 |
 | notes | 备注，不传给 fio |
+| time_based | `1` 按 `runtime_s` 定时运行；`0` 完成规划范围一次后退出；旧 Excel 没有此列时默认 `1` |
+| timeout_s | watchdog 秒数；`time_based=0` 时必须填写；定时用例留空则使用 `runtime_s + --timeout-grace` |
 
 `bs` 的 k/m/g 按 1024 换算；生成 job 文件时写为明确的字节数。第一版不支持 `bssplit`、块大小范围或在一个单元格填参数列表。要比较参数，请复制成多行用例。
 
@@ -73,7 +75,7 @@ sudo python3.11 fio_excel_runner.py \
 sudo python3.11 fio_excel_runner.py --excel 示例.xlsx --device /dev/sdb --dry-run
 ```
 
-旧版 Excel 需在 Cases 添加名为 `device` 的列，或直接使用本次更新的示例。
+旧版 Excel 只要已有 `device` 列即可继续使用；缺少 `time_based` 和 `timeout_s` 时自动按原来的定时模式处理。
 
 ### JobOverrides：单独配置某个 job
 
@@ -178,10 +180,18 @@ group_reporting=1
 norandommap=1
 randrepeat=0
 ramp_time=0
-time_based=1
 ```
 
-其中 `norandommap=1` 和 `time_based=1` 分别等价于启用你要求的 `norandommap`、`time_based`。
+其中 `norandommap=1` 等价于启用 `norandommap`。`time_based` 改为由每个 Cases 用例控制。
+
+`time_based=1` 时生成：
+
+```ini
+time_based=1
+runtime=60
+```
+
+`time_based=0` 时不生成 `time_based` 和 `runtime`，fio 完成规划范围一次后自然退出。比如示例中的 `precondition_write_84` 使用 `rw=write`、`jobs=1`、`numjobs=1`、`size=84%`，用于完整顺序写前 84%。该行默认禁用；启用后正式执行必须传 `--allow-write`。
 
 另外固定 `allow_file_create=0`、`exitall_on_error=1`：不创建目标文件；一个 job 出错时停止本用例的其余 job。纯读用例额外使用 fio 的 `--readonly`。
 
@@ -218,7 +228,7 @@ fio_results/
 ```text
 2026-09-22T14:00:00Z INFO [CONFIG_READ][suite] Reading Excel: /data/示例.xlsx
 2026-09-22T14:00:01Z INFO [SELECT][suite] Selected 5 cases in worksheet order
-2026-09-22T14:01:02Z INFO [CASE_RUN][case 2/5 id=randread_4k] Starting case; device=/dev/nvme1n1; workers=8; runtime=60s
+2026-09-22T14:01:02Z INFO [CASE_RUN][case 2/5 id=randread_4k] Starting case; device=/dev/nvme1n1; workers=8; mode=time_based runtime=60s; watchdog=120s
 2026-09-22T14:01:02Z INFO [CASE_RUN][case 2/5 id=randread_4k] Process started: pid=12345
 2026-09-22T14:01:12Z INFO [CASE_RUN][case 2/5 id=randread_4k] Process running: pid=12345; elapsed=10.0s
 ```
@@ -277,6 +287,17 @@ python3.11 fio_case_generator.py \
 
 生成器输出 `Cases` 和空的 `JobOverrides` 两个 sheet，并在写入后调用 runner 自己的 Excel 解析器做一次完整校验。默认最多生成 10000 个用例，可用 `--max-cases` 调整保护上限。对于 `rw`/`randrw`，可用 `--rwmixread` 指定读比例。
 
+生成完整范围用例时关闭定时模式，并显式设置 watchdog：
+
+```bash
+python3.11 fio_case_generator.py \
+  --rw write --bs 1M --iodepth 32 \
+  --jobs 1 --numjobs 1 \
+  --time-based 0 --timeout 7200 \
+  --device /dev/nvme1n1 --cpu-start 2 --cpu-end 2 \
+  --case-prefix precondition --output 预写用例.xlsx
+```
+
 可用以下命令跟踪进度，把目录替换成这次运行实际输出的归档目录：
 
 ```bash
@@ -301,7 +322,7 @@ sudo python3.11 fio_excel_runner.py --excel 示例.xlsx \
 
 出错用例记录为 `failed`、`timeout`、`preflight_failed` 或 `error`，已完成用例保留原状态；尚未运行的用例标记为 `skipped` 并写入原因，不会自动重试或启动后续用例。如果是在全部用例的预检阶段失败，则所有负载都不启动，其他用例标记为 `skipped`。中断时当前用例记为 `interrupted`，其余未运行用例也标记为 `skipped`。
 
-默认 watchdog 上限为 `runtime_s + 60` 秒，包括 fio 启动开销。可以用 `--timeout-grace 120` 调整额外时间。超时和 Ctrl+C 会先通知 fio 结束并等待报告落盘，再逐级终止；若必须强制杀死，`result.txt` 可能只含部分输出，状态会注明超时或中断。
+定时用例未填写 `timeout_s` 时，watchdog 上限为 `runtime_s + 60` 秒，包括 fio 启动开销，可以用 `--timeout-grace 120` 调整额外时间。填写了 `timeout_s` 时优先使用该值。`time_based=0` 必须填写 `timeout_s`，它只用于框架 watchdog，不会作为 fio 的 `runtime`。超时和 Ctrl+C 会先通知 fio 结束并等待报告落盘，再逐级终止；若必须强制杀死，`result.txt` 可能只含部分输出，状态会注明超时或中断。
 
 没有连接测试设备时，可以离线预览（Windows/Linux 均可）：
 

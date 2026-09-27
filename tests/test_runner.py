@@ -48,11 +48,28 @@ class RunnerTests(unittest.TestCase):
         ast.parse((PROJECT_ROOT / "fio_excel_runner.py").read_text(encoding="utf-8"), feature_version=(3, 11))
 
     def test_real_workbook_and_defaults(self):
-        self.assertEqual(len(self.cases), 5)
-        self.assertEqual([c["enabled"] for c in self.cases], [True, True, False, False, False])
+        self.assertEqual(len(self.cases), 6)
+        self.assertEqual([c["enabled"] for c in self.cases], [True, True, False, False, False, False])
         self.assertEqual(self.cases[0]["runtime_s"], 60)
+        self.assertTrue(self.cases[0]["time_based"])
+        self.assertIsNone(self.cases[0]["timeout_s"])
         self.assertEqual(self.cases[1]["total_workers"], 8)
         self.assertEqual(self.cases[0]["requested_device"], "/dev/nvme1n1")
+
+    def test_legacy_workbook_defaults_time_based(self):
+        cells = runner.read_xlsx(SAMPLE)
+        for coordinate in [key for key in cells["Cases"] if key.startswith(("N", "O"))]:
+            del cells["Cases"][coordinate]
+        with patch.object(runner, "read_xlsx", return_value=cells):
+            cases = runner.load_cases(SAMPLE)
+        self.assertTrue(all(case["time_based"] for case in cases))
+        self.assertTrue(all(case["timeout_s"] is None for case in cases))
+
+    def test_watchdog_selection(self):
+        self.assertEqual(runner.watchdog_seconds({"case_id":"timed", "time_based":True,
+                                                  "runtime_s":60, "timeout_s":None}, 30), 90)
+        self.assertEqual(runner.watchdog_seconds({"case_id":"full", "time_based":False,
+                                                  "runtime_s":None, "timeout_s":7200}, 30), 7200)
 
     def test_device_excel_and_cli_precedence(self):
         runner.resolve_case_devices(self.cases)
@@ -104,7 +121,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(second["region_end_exclusive"], 1680000000000)
 
     def test_job_overrides(self):
-        custom = self.cases[-1]
+        custom = next(c for c in self.cases if c["case_id"] == "custom_jobs")
         self.assertEqual(custom["total_workers"], 4)
         self.assertEqual([j["numjobs"] for j in custom["job_list"]], [1, 3])
         self.assertEqual([j["rw"] for j in custom["job_list"]], ["read", "randwrite"])
@@ -146,7 +163,8 @@ class RunnerTests(unittest.TestCase):
             runner.allocate_job_cpus(251,253,[4])
 
     def test_heterogeneous_jobs_cpu_mapping(self):
-        plan = runner.make_plan(self.cases[-1],"/dev/test",10**12,512)
+        case = next(c for c in self.cases if c["case_id"] == "custom_jobs")
+        plan = runner.make_plan(case,"/dev/test",10**12,512)
         self.assertEqual([r["cpus_allowed"] for r in plan["cpu_assignments"]],["2","15-17"])
         # fio split uses the global instance index, so the second job rotates.
         self.assertEqual([w["expected_cpu"] for w in plan["workers"]],[2,16,17,15])
@@ -172,6 +190,11 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(plan["region_end_exclusive"] % job["bs_bytes"], 0)
                 for option in runner.FIXED:
                     self.assertIn(option + "\n", plan["fio_text"])
+                if case["time_based"]:
+                    self.assertIn("time_based=1\n", plan["fio_text"])
+                else:
+                    self.assertNotIn("time_based=", plan["fio_text"])
+                    self.assertNotIn("runtime=", plan["fio_text"])
                 self.assertIn("offset=0\n", plan["fio_text"])
                 self.assertNotIn("offset_increment", plan["fio_text"])
 
@@ -186,7 +209,7 @@ class RunnerTests(unittest.TestCase):
     def test_readable_percent_ranges(self):
         single = runner.make_plan(self.cases[0], "/dev/test", 10**12 + 37, 512)
         self.assertIn("size=84%\n", single["fio_text"])
-        case = copy.deepcopy(self.cases[-1])
+        case = copy.deepcopy(next(c for c in self.cases if c["case_id"] == "custom_jobs"))
         for job in case["job_list"]:
             job["bs_bytes"] = 4096
         plan = runner.make_plan(case, "/dev/test", 4096 * 100 * 1000000, 4096)
@@ -194,7 +217,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([r["fio_offset"] for r in plan["job_regions"]], ["0", "42%"])
 
     def test_unaligned_percent_uses_bytes(self):
-        plan = runner.make_plan(self.cases[-1], "/dev/test", 10**12 + 1, 512)
+        case = next(c for c in self.cases if c["case_id"] == "custom_jobs")
+        plan = runner.make_plan(case, "/dev/test", 10**12 + 1, 512)
         self.assertTrue(all("%" not in r["fio_size"] for r in plan["job_regions"]))
         self.assertTrue(all("%" not in r["fio_offset"] for r in plan["job_regions"]))
         self.assertEqual(plan["job_regions"][0]["nominal_range"], "[0%, 42%)")
@@ -242,7 +266,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertLessEqual(max(lengths)-min(lengths), plan["region_alignment_bytes"])
 
     def test_numjobs_does_not_change_independent_job_regions(self):
-        case = copy.deepcopy(self.cases[-1])
+        case = copy.deepcopy(next(c for c in self.cases if c["case_id"] == "custom_jobs"))
         first = runner.make_plan(case, "/dev/test", 10**12, 512)
         case["job_list"][0]["numjobs"] = 9
         case["total_workers"] = 12
@@ -251,7 +275,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(second["workers"]), 12)
 
     def test_reject_partition_too_small(self):
-        case = copy.deepcopy(self.cases[-1])
+        case = copy.deepcopy(next(c for c in self.cases if c["case_id"] == "custom_jobs"))
         for job in case["job_list"]:
             job["bs_bytes"] = 4096
         with self.assertRaisesRegex(runner.ConfigError, "every independent job"):
@@ -292,7 +316,7 @@ class RunnerTests(unittest.TestCase):
             ET.SubElement(row,ns+"c",{"r":"A999","s":"0"})
             return ET.tostring(root)
         cases = runner.load_cases(self.workbook_edit("xl/worksheets/sheet1.xml", edit))
-        self.assertEqual(len(cases),5)
+        self.assertEqual(len(cases),6)
         self.assertEqual(cases[0]["case_id"],"inline_case")
 
     def test_duplicate_case_and_unknown_override_rejected(self):
@@ -312,12 +336,12 @@ class RunnerTests(unittest.TestCase):
         cells = runner.read_xlsx(SAMPLE)
         del cells["JobOverrides"]
         rows = cells["Cases"]
-        for i in range(1,7):
+        for i in range(1,8):
             a,b = rows.get(f"A{i}"),rows.get(f"B{i}")
             rows[f"A{i}"],rows[f"B{i}"] = b,a
         with patch.object(runner,"read_xlsx",return_value=cells):
             cases = runner.load_cases(SAMPLE)
-        self.assertEqual(cases[-1]["total_workers"],4)
+        self.assertEqual(next(c for c in cases if c["case_id"] == "custom_jobs")["total_workers"],4)
         self.assertTrue(cases[0]["enabled"])
 
     def test_offline_cli_and_archive(self):

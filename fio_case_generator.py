@@ -58,6 +58,13 @@ def generate_rows(args):
     jobs_values = int_values(args.jobs, "jobs", maximum=65536)
     numjobs_values = int_values(args.numjobs, "numjobs", maximum=65536)
     runtimes = int_values(args.runtime, "runtime")
+    time_based = bool(args.time_based)
+    timeout_s = integer(args.timeout, "--timeout") if args.timeout is not None else None
+    if not time_based:
+        if args.runtime != "60":
+            raise ConfigError("--runtime is not used when --time-based=0; omit it")
+        if timeout_s is None:
+            raise ConfigError("--timeout is required when --time-based=0")
     cpu_start = integer(args.cpu_start, "--cpu-start", minimum=0, maximum=65535)
     cpu_end = integer(args.cpu_end, "--cpu-end", minimum=cpu_start, maximum=65535)
     cpu_count = cpu_end - cpu_start + 1
@@ -72,10 +79,12 @@ def generate_rows(args):
         if jobs * numjobs > 65536:
             raise ConfigError(f"jobs={jobs} × numjobs={numjobs} exceeds the 65536 total-worker limit")
         mixed = rw in {"rw", "randrw"}
+        runtime_value = runtime if time_based else ""
+        runtime_id = runtime if time_based else "full"
         rows.append([
-            make_case_id(args.case_prefix, index, rw, bs, depth, jobs, numjobs, runtime),
-            1, args.device, rw, bs, depth, jobs, numjobs, cpu_start, cpu_end, runtime,
-            args.rwmixread if mixed else "", args.notes,
+            make_case_id(args.case_prefix, index, rw, bs, depth, jobs, numjobs, runtime_id),
+            1, args.device, rw, bs, depth, jobs, numjobs, cpu_start, cpu_end, runtime_value,
+            args.rwmixread if mixed else "", args.notes, 1 if time_based else 0, timeout_s or "",
         ])
     return rows
 
@@ -91,6 +100,10 @@ def arguments(argv=None):
     parser.add_argument("--jobs", default="1", help="comma-separated independent job counts; default 1")
     parser.add_argument("--numjobs", default="1", help="comma-separated clones per job; default 1")
     parser.add_argument("--runtime", default="60", help="comma-separated runtimes in seconds; default 60")
+    parser.add_argument("--time-based", type=int, choices=(0, 1), default=1,
+                        help="1: run for runtime seconds; 0: complete the range once")
+    parser.add_argument("--timeout", type=int,
+                        help="per-case watchdog seconds; required for --time-based=0")
     parser.add_argument("--rwmixread", type=int, default=50, help="read percentage for rw/randrw; default 50")
     parser.add_argument("--case-prefix", default="auto", help="ASCII prefix used in generated case_id")
     parser.add_argument("--notes", default="generated Cartesian product")

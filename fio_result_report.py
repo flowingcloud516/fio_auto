@@ -30,7 +30,8 @@ def case_signature(case):
             for job in case.get("job_list", [])]
     return {
         "device": case.get("device", case.get("requested_device", "")), "cpu_start": case.get("cpu_start"),
-        "cpu_end": case.get("cpu_end"), "runtime_s": case.get("runtime_s"), "jobs": jobs,
+        "cpu_end": case.get("cpu_end"), "time_based": case.get("time_based", True),
+        "runtime_s": case.get("runtime_s"), "timeout_s": case.get("timeout_s"), "jobs": jobs,
     }
 
 
@@ -214,7 +215,8 @@ def overview_row(case, latest, status, reason, run_count, pass_count, history_co
               latest.get("finished_at", "") if latest else "", case.get("requested_device", ""),
               ",".join(j["rw"] for j in jobs), ",".join(str(j["bs_bytes"]) for j in jobs),
               ",".join(str(j["iodepth"]) for j in jobs), len(jobs),
-              ",".join(str(j["numjobs"]) for j in jobs), case["cpu_start"], case["cpu_end"], case["runtime_s"]]
+              ",".join(str(j["numjobs"]) for j in jobs), case["cpu_start"], case["cpu_end"],
+              1 if case.get("time_based", True) else 0, case.get("runtime_s"), case.get("timeout_s")]
     values += [latest.get(k) if latest else None for k in METRIC_KEYS]
     return values
 
@@ -229,7 +231,8 @@ def detail_row(a, match):
 
 
 OVERVIEW_HEADERS = ["用例ID", "启用", "当前状态", "说明", "执行次数", "成功次数", "同ID历史数", "最新批次", "完成时间",
-                    "设备", "rw", "bs(bytes)", "iodepth", "jobs", "numjobs", "CPU起始", "CPU结束", "运行时间(s)"] + METRIC_KEYS
+                    "设备", "rw", "bs(bytes)", "iodepth", "jobs", "numjobs", "CPU起始", "CPU结束",
+                    "time_based", "运行时间(s)", "watchdog(s)"] + METRIC_KEYS
 DETAIL_HEADERS = ["用例ID", "批次", "状态", "匹配当前配置", "创建时间", "开始时间", "完成时间", "退出码", "原因", "指标说明", "用例目录"] + METRIC_KEYS
 EXCEPTION_HEADERS = ["用例ID", "状态", "原因", "指标说明", "批次"]
 
