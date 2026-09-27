@@ -11,9 +11,9 @@ import re
 import sys
 import zipfile
 
-from fio_excel_runner import ConfigError, load_cases
+from fio_excel_runner import CASE_COLUMNS, ConfigError, load_cases
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 FINAL_EXECUTED = {"passed", "failed", "timeout", "interrupted", "error"}
 BAD = {"failed", "timeout", "interrupted", "error", "preflight_failed", "skipped", "corrupt"}
 STATUS_CN = {
@@ -170,7 +170,7 @@ def build_rows(cases, attempts):
     by_case = {}
     for attempt in attempts:
         by_case.setdefault(attempt.get("case_id"), []).append(attempt)
-    overview, details, exceptions = [], [], []
+    overview, details, exceptions, job_rows = [], [], [], []
     design = {c["case_id"]: c for c in cases}
     for attempt in attempts:
         current = design.get(attempt.get("case_id"))
@@ -193,11 +193,15 @@ def build_rows(cases, attempts):
         passed = [x for x in matching if x.get("status") == "passed"]
         row = overview_row(case, latest, status, reason, len(executed), len(passed), len(history))
         overview.append(row)
+        for job in case["job_list"]:
+            job_rows.append([case["case_id"], job["job_index"], job["rw"], job["bs_bytes"],
+                             job["iodepth"], job["numjobs"], job["rwmixread"],
+                             case["cpu_start"], case["cpu_end"], STATUS_CN.get(status, status)])
         if status not in {"passed", "disabled"} or (latest and latest.get("metric_error")):
             exceptions.append([case["case_id"], STATUS_CN.get(status, status), reason,
                                latest.get("metric_error", "") if latest else "",
                                latest.get("batch", "") if latest else ""])
-    return overview, details, exceptions
+    return overview, details, exceptions, job_rows
 
 
 METRIC_KEYS = [
@@ -209,14 +213,15 @@ METRIC_KEYS = [
 
 
 def overview_row(case, latest, status, reason, run_count, pass_count, history_count):
-    jobs = case["job_list"]
-    values = [case["case_id"], "是" if case["enabled"] else "否", STATUS_CN.get(status, status), reason,
-              run_count, pass_count, history_count, latest.get("batch", "") if latest else "",
-              latest.get("finished_at", "") if latest else "", case.get("requested_device", ""),
-              ",".join(j["rw"] for j in jobs), ",".join(str(j["bs_bytes"]) for j in jobs),
-              ",".join(str(j["iodepth"]) for j in jobs), len(jobs),
-              ",".join(str(j["numjobs"]) for j in jobs), case["cpu_start"], case["cpu_end"],
-              1 if case.get("time_based", True) else 0, case.get("runtime_s"), case.get("timeout_s")]
+    source = case.get("source_values", {})
+    config = [case["case_id"], 1 if case["enabled"] else 0, case.get("requested_device", ""),
+              source.get("rw", ""), source.get("bs", ""), source.get("iodepth", ""), case["jobs"],
+              source.get("numjobs", ""), case["cpu_start"], case["cpu_end"], case.get("runtime_s"),
+              source.get("rwmixread", ""), source.get("notes", ""),
+              1 if case.get("time_based", True) else 0, case.get("timeout_s")]
+    values = config + [STATUS_CN.get(status, status), reason, run_count, pass_count, history_count,
+                       latest.get("batch", "") if latest else "",
+                       latest.get("finished_at", "") if latest else ""]
     values += [latest.get(k) if latest else None for k in METRIC_KEYS]
     return values
 
@@ -230,11 +235,12 @@ def detail_row(a, match):
     return values
 
 
-OVERVIEW_HEADERS = ["用例ID", "启用", "当前状态", "说明", "执行次数", "成功次数", "同ID历史数", "最新批次", "完成时间",
-                    "设备", "rw", "bs(bytes)", "iodepth", "jobs", "numjobs", "CPU起始", "CPU结束",
-                    "time_based", "运行时间(s)", "watchdog(s)"] + METRIC_KEYS
+OVERVIEW_HEADERS = list(CASE_COLUMNS) + ["当前状态", "状态说明", "执行次数", "成功次数", "同ID历史数",
+                                               "最新批次", "完成时间"] + METRIC_KEYS
 DETAIL_HEADERS = ["用例ID", "批次", "状态", "匹配当前配置", "创建时间", "开始时间", "完成时间", "退出码", "原因", "指标说明", "用例目录"] + METRIC_KEYS
 EXCEPTION_HEADERS = ["用例ID", "状态", "原因", "指标说明", "批次"]
+JOB_HEADERS = ["case_id", "job_index", "rw", "bs_bytes", "iodepth", "numjobs", "rwmixread",
+               "cpu_start", "cpu_end", "当前状态"]
 
 
 def col_name(number):
@@ -308,13 +314,14 @@ def main(argv=None):
     args = arguments(argv)
     cases = load_cases(args.excel)
     attempts = scan_archives(args.results)
-    overview, details, exceptions = build_rows(cases, attempts)
+    overview, details, exceptions, job_rows = build_rows(cases, attempts)
     summary = [["生成时间", dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")],
                ["设计用例数", len(cases)], ["启用用例数", sum(c["enabled"] for c in cases)],
                ["扫描执行记录数", len(attempts)], ["异常/待执行用例数", len(exceptions)],
                ["设计文件", str(args.excel.resolve())], ["结果目录", str(args.results.resolve())]]
     write_xlsx(args.output, [("统计概览", ["项目", "值"], summary),
                              ("用例覆盖", OVERVIEW_HEADERS, overview),
+                             ("Job配置", JOB_HEADERS, job_rows),
                              ("运行明细", DETAIL_HEADERS, details),
                              ("异常清单", EXCEPTION_HEADERS, exceptions)])
     print(f"Report written: {args.output.resolve()}")

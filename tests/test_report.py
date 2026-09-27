@@ -44,7 +44,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report.main(["--excel", str(SAMPLE), "--results", str(self.root / "fio_results"),
                                       "--output", str(output)]), 0)
         with zipfile.ZipFile(output) as archive:
-            self.assertIn("xl/worksheets/sheet4.xml", archive.namelist())
+            self.assertIn("xl/worksheets/sheet5.xml", archive.namelist())
             ET.fromstring(archive.read("xl/worksheets/sheet2.xml"))
             content = archive.read("xl/worksheets/sheet2.xml").decode()
             self.assertIn("已通过", content)
@@ -53,10 +53,24 @@ class ReportTests(unittest.TestCase):
     def test_changed_config_is_not_current_execution(self):
         case = runner.load_cases(SAMPLE)[0]
         self.make_attempt(case, changed=True)
-        overview, _, exceptions = report.build_rows(runner.load_cases(SAMPLE), report.scan_archives(self.root / "fio_results"))
-        self.assertEqual(overview[0][2], "配置已变更")
-        self.assertEqual(overview[0][4], 0)
+        overview, _, exceptions, jobs = report.build_rows(runner.load_cases(SAMPLE), report.scan_archives(self.root / "fio_results"))
+        status_col = report.OVERVIEW_HEADERS.index("当前状态")
+        run_count_col = report.OVERVIEW_HEADERS.index("执行次数")
+        self.assertEqual(overview[0][status_col], "配置已变更")
+        self.assertEqual(overview[0][run_count_col], 0)
         self.assertEqual(exceptions[0][0], case["case_id"])
+        self.assertGreater(len(jobs), 0)
+
+    def test_overview_uses_individual_cases_columns(self):
+        cases = runner.load_cases(SAMPLE)
+        overview, _, _, jobs = report.build_rows(cases, [])
+        self.assertEqual(report.OVERVIEW_HEADERS[:len(runner.CASE_COLUMNS)], list(runner.CASE_COLUMNS))
+        row = dict(zip(report.OVERVIEW_HEADERS, overview[0]))
+        self.assertEqual(row["rw"], "read")
+        self.assertEqual(row["bs"], "1m")
+        self.assertEqual(row["iodepth"], "32")
+        self.assertEqual(row["jobs"], 1)
+        self.assertEqual(jobs[0][report.JOB_HEADERS.index("rw")], "read")
 
     def test_combined_output_json_extraction(self):
         source = self.root / "result.txt"

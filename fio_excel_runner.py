@@ -194,7 +194,7 @@ def load_cases(path):
                           requested_device=values["device"],
                           cpu_start=start, cpu_end=end,
                           time_based=time_based, runtime_s=runtime_s, timeout_s=timeout_s,
-                          defaults=values, overrides={}))
+                          source_values=dict(values), defaults=values, overrides={}))
     by_id = {c["case_id"]: c for c in cases}
     if "JobOverrides" in sheets:
         for row, values in sheet_records(sheets["JobOverrides"], JOB_COLUMNS, "JobOverrides"):
@@ -733,7 +733,7 @@ def prepare_and_run(args, root, progress):
         folder = root / f"{index:03}_{plan['case_id']}"
         folder.mkdir()
         (folder / "jobs.fio").write_text(plan["fio_text"], encoding="utf-8", newline="\n")
-        info = {k: v for k, v in plan.items() if k not in ("fio_text", "workers")}
+        info = {k: v for k, v in plan.items() if k not in ("fio_text", "workers", "source_values")}
         info.update(status="planned" if args.dry_run else "pending", created_at=stamp(),
                     case_index=index, case_count=len(plans))
         write_json(folder / "run_info.json", info)
