@@ -12,7 +12,7 @@ import sys
 from fio_excel_runner import CASE_COLUMNS, JOB_COLUMNS, ConfigError, RW, block_size, integer, load_cases
 from fio_result_report import write_xlsx
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def csv_values(value, name):
@@ -85,6 +85,7 @@ def generate_rows(args):
             make_case_id(args.case_prefix, index, rw, bs, depth, jobs, numjobs, runtime_id),
             1, args.device, rw, bs, depth, jobs, numjobs, cpu_start, cpu_end, runtime_value,
             args.rwmixread if mixed else "", args.notes, 1 if time_based else 0, timeout_s or "",
+            args.numa_mem_policy,
         ])
     return rows
 
@@ -104,6 +105,8 @@ def arguments(argv=None):
                         help="1: run for runtime seconds; 0: complete the range once")
     parser.add_argument("--timeout", type=int,
                         help="per-case watchdog seconds; required for --time-based=0")
+    parser.add_argument("--numa-mem-policy", default="",
+                        help="fio NUMA memory policy, e.g. bind:0, prefer:1 or interleave:0-1")
     parser.add_argument("--rwmixread", type=int, default=50, help="read percentage for rw/randrw; default 50")
     parser.add_argument("--case-prefix", default="auto", help="ASCII prefix used in generated case_id")
     parser.add_argument("--notes", default="generated Cartesian product")

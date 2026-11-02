@@ -64,6 +64,7 @@ sudo python3.11 fio_excel_runner.py \
 | notes | 备注，不传给 fio |
 | time_based | `1` 按 `runtime_s` 定时运行；`0` 完成规划范围一次后退出；旧 Excel 没有此列时默认 `1` |
 | timeout_s | watchdog 秒数；`time_based=0` 时必须填写；定时用例留空则使用 `runtime_s + --timeout-grace` |
+| numa_mem_policy | 可选的 fio NUMA 内存策略，如 `bind:0`、`prefer:1`、`interleave:0-1`、`local`；留空不设置 |
 
 `bs` 的 k/m/g 按 1024 换算；生成 job 文件时写为明确的字节数。第一版不支持 `bssplit`、块大小范围或在一个单元格填参数列表。要比较参数，请复制成多行用例。
 
@@ -75,11 +76,11 @@ sudo python3.11 fio_excel_runner.py \
 sudo python3.11 fio_excel_runner.py --excel 示例.xlsx --device /dev/sdb --dry-run
 ```
 
-旧版 Excel 只要已有 `device` 列即可继续使用；缺少 `time_based` 和 `timeout_s` 时自动按原来的定时模式处理。
+旧版 Excel 只要已有 `device` 列即可继续使用；缺少 `time_based`、`timeout_s` 和 `numa_mem_policy` 时自动按原来的定时模式处理，并且不设置 NUMA 内存策略。
 
 ### JobOverrides：单独配置某个 job
 
-用 `case_id` 和 `job_index` 指定要覆盖的 job。`job_index` 从 1 开始，不超过该用例的 `jobs`。可覆盖 `rw`、`bs`、`iodepth`、`numjobs`、`rwmixread`，空白继承 Cases。
+用 `case_id` 和 `job_index` 指定要覆盖的 job。`job_index` 从 1 开始，不超过该用例的 `jobs`。可覆盖 `rw`、`bs`、`iodepth`、`numjobs`、`rwmixread`、`numa_mem_policy`，空白继承 Cases。
 
 例如示例中的 `custom_jobs` 生成两个配置段：
 
@@ -136,6 +137,21 @@ fio 的 split 仍按全局实例序号在该 job 的区间内取模。因此不�
 `cpu_mapping.csv` 是基于 fio split 规则生成的**预期分配**，不是运行时采样结果。当前版本不采集实际 CPU 调度轨迹，不修改 IRQ 亲和性，也不承诺各核 CPU 使用率或 IOPS 相同。按 CPU 编号分散 job 区间并不等价于按 NUMA 或物理核拓扑分散。
 
 整个输入闭区间必须在线且属于当前进程可用的 affinity/cpuset；不符合时明确报错，不会静默缩小范围。
+
+### NUMA 内存绑定
+
+CPU 亲和性和内存 NUMA 策略是两个独立设置：`cpus_allowed` 决定 fio worker 在哪些逻辑 CPU 上运行，`numa_mem_policy` 决定 fio I/O buffer 从哪些 NUMA node 分配。常用配置：
+
+```text
+numa_mem_policy=bind:0          # 严格绑定 node 0
+numa_mem_policy=prefer:1        # 优先 node 1，内存不足时允许其他节点
+numa_mem_policy=interleave:0-1  # 在 node 0、1 间交错分配
+numa_mem_policy=local           # 使用 worker 执行时的本地节点
+```
+
+Cases 中的值是该用例所有独立 job 的默认策略；JobOverrides 可以逐 job 覆盖。一个 job 的所有 `numjobs` 实例共享这个策略。若不同实例需要不同内存节点，应拆成多个独立 job。
+
+正式运行前会检查配置中的 NUMA node 是否在线；fio 的 `--parse-only` 还会检查当前 fio 是否认识 NUMA 选项。fio 必须在安装了 libnuma 开发库的环境中构建，否则会报告 `Bad option <numa_mem_policy=...>`。可用 `numactl --hardware` 和 `cat /sys/devices/system/node/online` 查看节点。参数格式遵循 [fio 官方 NUMA 文档](https://fio.readthedocs.io/en/latest/fio_doc.html?highlight=numa_mem_policy)。
 
 ## 磁盘范围与固定参数
 
@@ -235,7 +251,7 @@ fio_results/
 
 这里的 `2/5` 表示本次选中的第 2 个用例、共 5 个，不包含禁用或未被 `--case` 选中的行。示例日志仅说明格式。
 
-记录的阶段包括 `STARTUP`、`CONFIG_READ`、`SELECT`、`CPU_CHECK`、`DEVICE_CHECK`、`PLAN_GENERATE`、`WRITE_GUARD`、`FIO_CHECK`、`ARCHIVE`、`DEVICE_LOCK`、`PREFLIGHT`、`CASE_RECHECK`、`CASE_RUN`、`CASE_DONE`；预览完成时为 `PREVIEW_DONE`。设备、容量、CPU/区域规划阶段、实际命令、子进程 PID、日志路径、退出码和中止信号都有记录。Python 异常保留 traceback。
+记录的阶段包括 `STARTUP`、`CONFIG_READ`、`SELECT`、`CPU_CHECK`、`NUMA_CHECK`、`DEVICE_CHECK`、`PLAN_GENERATE`、`WRITE_GUARD`、`FIO_CHECK`、`ARCHIVE`、`DEVICE_LOCK`、`PREFLIGHT`、`CASE_RECHECK`、`CASE_RUN`、`CASE_DONE`；预览完成时为 `PREVIEW_DONE`。设备、容量、CPU/NUMA/区域规划阶段、实际命令、子进程 PID、日志路径、退出码和中止信号都有记录。Python 异常保留 traceback。
 
 fio 子进程等待期间每 10 秒输出一条存活等待日志。fio 使用 `--output-format=normal,json` 一次运行同时输出普通文本和 JSON；完整原始输出写入 `result.txt`，其中的 JSON 对象另存为 `result.json`，不会重复执行负载。
 
@@ -283,6 +299,15 @@ python3.11 fio_case_generator.py \
   --jobs 1,2 --numjobs 1,4 --runtime 30,60 \
   --device /dev/nvme1n1 --cpu-start 0 --cpu-end 15 \
   --case-prefix perf --output 生成用例.xlsx
+```
+
+生成器也可以为全部生成用例设置 NUMA 内存策略：
+
+```bash
+python3.11 fio_case_generator.py \
+  --rw randread --bs 4K --iodepth 32 \
+  --device /dev/nvme1n1 --cpu-start 0 --cpu-end 7 \
+  --numa-mem-policy bind:0 --output NUMA用例.xlsx
 ```
 
 生成器输出 `Cases` 和空的 `JobOverrides` 两个 sheet，并在写入后调用 runner 自己的 Excel 解析器做一次完整校验。默认最多生成 10000 个用例，可用 `--max-cases` 调整保护上限。对于 `rw`/`randrw`，可用 `--rwmixread` 指定读比例。

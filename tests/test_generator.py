@@ -64,6 +64,13 @@ class GeneratorTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.ConfigError, "--timeout is required"):
             generator.main(self.base() + ["--time-based", "0", "--output", str(self.root/"x.xlsx")])
 
+    def test_numa_memory_policy_generation(self):
+        output = self.root / "numa.xlsx"
+        generator.main(self.base() + ["--numa-mem-policy", "bind:1", "--output", str(output)])
+        cases = runner.load_cases(output)
+        self.assertTrue(all(job["numa_mem_policy"] == "bind:1"
+                            for case in cases for job in case["job_list"]))
+
 
 if __name__ == "__main__":
     unittest.main()

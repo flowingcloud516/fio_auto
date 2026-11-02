@@ -288,6 +288,30 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(runner.ConfigError):
                 runner.block_size(value,"bs")
 
+    def test_numa_memory_policy_validation_and_job_output(self):
+        for value in ("default", "local", "prefer:1", "bind:0", "bind:0-1", "interleave:0,2-3", "bind:all"):
+            self.assertEqual(runner.numa_mem_policy(value, "policy"), value)
+        for value in ("bind", "prefer:0-1", "local:0", "bind:2-1", "unknown:0", "bind:0,,1"):
+            with self.assertRaises(runner.ConfigError):
+                runner.numa_mem_policy(value, "policy")
+        case = copy.deepcopy(next(c for c in self.cases if c["case_id"] == "custom_jobs"))
+        case["job_list"][0]["numa_mem_policy"] = "bind:0"
+        case["job_list"][1]["numa_mem_policy"] = "prefer:1"
+        plan = runner.make_plan(case, "/dev/test", 10**12, 512)
+        self.assertEqual(plan["fio_text"].count("numa_mem_policy="), 2)
+        self.assertIn("numa_mem_policy=bind:0\n", plan["fio_text"])
+        self.assertIn("numa_mem_policy=prefer:1\n", plan["fio_text"])
+
+    def test_numa_nodes_must_be_online(self):
+        case = copy.deepcopy(self.cases[0])
+        case["job_list"][0]["numa_mem_policy"] = "bind:0-1"
+        online = self.root / "numa_online"
+        online.write_text("0-1\n", encoding="ascii")
+        runner.check_numa_nodes([case], online)
+        online.write_text("0\n", encoding="ascii")
+        with self.assertRaisesRegex(runner.ConfigError, "not online"):
+            runner.check_numa_nodes([case], online)
+
     def test_formula_rejected_even_with_cached_value(self):
         def edit(data):
             root = ET.fromstring(data)

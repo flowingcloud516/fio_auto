@@ -25,13 +25,15 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 DISK_RANGE_PERCENT = 84
 CASE_BASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
                      "cpu_start", "cpu_end", "runtime_s", "rwmixread", "notes")
-CASE_OPTIONAL_COLUMNS = ("time_based", "timeout_s")
+CASE_OPTIONAL_COLUMNS = ("time_based", "timeout_s", "numa_mem_policy")
 CASE_COLUMNS = CASE_BASE_COLUMNS + CASE_OPTIONAL_COLUMNS
-JOB_COLUMNS = ("case_id", "job_index", "rw", "bs", "iodepth", "numjobs", "rwmixread", "notes")
+JOB_BASE_COLUMNS = ("case_id", "job_index", "rw", "bs", "iodepth", "numjobs", "rwmixread", "notes")
+JOB_OPTIONAL_COLUMNS = ("numa_mem_policy",)
+JOB_COLUMNS = JOB_BASE_COLUMNS + JOB_OPTIONAL_COLUMNS
 RW = {"read", "write", "randread", "randwrite", "rw", "randrw"}
 FIXED = ("direct=1", "ioengine=libaio", "group_reporting=1", "norandommap=1",
          "randrepeat=0", "ramp_time=0")
@@ -63,6 +65,32 @@ def block_size(value, label):
     if not match:
         fail(f"{label}: use a single block size, e.g. 4k, 128k, 1m or 4096")
     return int(match[1]) * 1024 ** (" kmg".index(match[2].lower()) if match[2] else 0)
+
+
+def numa_mem_policy(value, label):
+    """Validate fio's numa_mem_policy syntax and return a normalized value."""
+    if value in (None, ""):
+        return None
+    text = re.sub(r"\s+", "", str(value).lower())
+    mode, separator, nodes = text.partition(":")
+    if mode not in {"default", "prefer", "bind", "interleave", "local"}:
+        fail(f"{label}: mode must be default, prefer, bind, interleave or local")
+    if mode in {"default", "local"}:
+        if separator:
+            fail(f"{label}: {mode} does not accept a node list")
+        return mode
+    if not separator or not nodes:
+        fail(f"{label}: {mode} requires a node list, e.g. {mode}:0")
+    if nodes != "all" and not re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", nodes):
+        fail(f"{label}: invalid NUMA node list {nodes!r}")
+    if mode == "prefer" and (nodes == "all" or "," in nodes or "-" in nodes):
+        fail(f"{label}: prefer accepts exactly one NUMA node")
+    if nodes != "all":
+        for part in nodes.split(","):
+            ends = [int(item) for item in part.split("-")]
+            if len(ends) == 2 and ends[0] > ends[1]:
+                fail(f"{label}: invalid descending NUMA node range {part}")
+    return f"{mode}:{nodes}"
 
 
 def read_xlsx(path):
@@ -158,7 +186,9 @@ def effective_job(data, label):
                 iodepth=integer(data["iodepth"], f"{label}.iodepth"),
                 numjobs=integer(data["numjobs"], f"{label}.numjobs", maximum=65536),
                 rwmixread=integer(mix, f"{label}.rwmixread", minimum=0, maximum=100, default=50)
-                if rw in {"rw", "randrw"} else None)
+                if rw in {"rw", "randrw"} else None,
+                numa_mem_policy=numa_mem_policy(data.get("numa_mem_policy", ""),
+                                                 f"{label}.numa_mem_policy"))
 
 
 def load_cases(path):
@@ -197,7 +227,8 @@ def load_cases(path):
                           source_values=dict(values), defaults=values, overrides={}))
     by_id = {c["case_id"]: c for c in cases}
     if "JobOverrides" in sheets:
-        for row, values in sheet_records(sheets["JobOverrides"], JOB_COLUMNS, "JobOverrides"):
+        for row, values in sheet_records(sheets["JobOverrides"], JOB_BASE_COLUMNS, "JobOverrides",
+                                         JOB_OPTIONAL_COLUMNS):
             label = f"JobOverrides row {row}"
             case = by_id.get(values["case_id"])
             if case is None:
@@ -206,7 +237,8 @@ def load_cases(path):
             if index in case["overrides"]:
                 fail(f"{label}: duplicate override for job {index}")
             case["overrides"][index] = {k: v for k, v in values.items()
-                                        if k in ("rw", "bs", "iodepth", "numjobs", "rwmixread") and v != ""}
+                                        if k in ("rw", "bs", "iodepth", "numjobs", "rwmixread",
+                                                 "numa_mem_policy") and v != ""}
     for case in cases:
         job_list = []
         for index in range(1, case["jobs"] + 1):
@@ -332,6 +364,8 @@ def make_plan(case, device, capacity, sector):
                   f"cpus_allowed={cpu_arg}", "cpus_allowed_policy=split"]
         if job["rwmixread"] is not None:
             lines.append(f"rwmixread={job['rwmixread']}")
+        if job.get("numa_mem_policy") is not None:
+            lines.append(f"numa_mem_policy={job['numa_mem_policy']}")
         lines.append("")
         for clone in range(job["numjobs"]):
             # fio uses (global thread_number - 1) % cpus_in_mask for split.
@@ -401,6 +435,36 @@ def check_cpus(cases):
         missing = requested - (online & allowed)
         if missing:
             fail(f"{case['case_id']}: requested CPU(s) offline or outside current affinity/cpuset: {sorted(missing)}")
+
+
+def expand_id_list(text, label):
+    values = set()
+    for part in text.strip().split(","):
+        if not part:
+            fail(f"{label}: empty list element")
+        ends = [int(item) for item in part.split("-")]
+        if len(ends) > 2 or (len(ends) == 2 and ends[0] > ends[1]):
+            fail(f"{label}: invalid range {part!r}")
+        values.update(range(ends[0], ends[-1] + 1))
+    return values
+
+
+def check_numa_nodes(cases, online_path=Path("/sys/devices/system/node/online")):
+    policies = [(case["case_id"], job["job_index"], job.get("numa_mem_policy"))
+                for case in cases for job in case["job_list"] if job.get("numa_mem_policy")]
+    if not policies:
+        return
+    if not online_path.is_file():
+        fail("NUMA memory policy requested, but /sys/devices/system/node/online is unavailable")
+    online = expand_id_list(online_path.read_text().strip(), "online NUMA nodes")
+    for case_id, job_index, policy in policies:
+        mode, separator, node_list = policy.partition(":")
+        if not separator or node_list == "all":
+            continue
+        requested = expand_id_list(node_list, f"{case_id}.job_{job_index:03}.numa_mem_policy")
+        missing = requested - online
+        if missing:
+            fail(f"{case_id}.job_{job_index:03}: NUMA node(s) not online: {sorted(missing)}")
 
 
 def stamp():
@@ -624,6 +688,7 @@ def run_suite(plans, root, fio, timeout_grace, devices, progress):
                 fail("Device identity, capacity or sector size changed since preflight")
             check_device_idle(device)
             check_cpus([plan])
+            check_numa_nodes([plan])
             command = [fio, "--output-format=normal,json", "--eta=never"]
             if not plan["writes"]:
                 command.append("--readonly")
@@ -696,6 +761,8 @@ def prepare_and_run(args, root, progress):
             fail("Execution/device detection requires Linux; use offline --dry-run on other systems")
         progress.step("CPU_CHECK", "Checking requested CPU ranges against online CPUs and process affinity")
         check_cpus(active)
+        progress.step("NUMA_CHECK", "Checking requested NUMA memory nodes")
+        check_numa_nodes(active)
     devices = {}
     plans = []
     for index, case in enumerate(active, 1):

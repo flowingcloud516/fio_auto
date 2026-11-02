@@ -77,6 +77,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(repeated["bs"], "4K")
         self.assertEqual(repeated["iodepth"], 32)
         self.assertEqual(repeated["numjobs"], 2)
+        self.assertEqual(repeated["numa_mem_policy"], "")
 
         custom_index = next(i for i, case in enumerate(cases) if case["case_id"] == "custom_jobs")
         custom = dict(zip(report.OVERVIEW_HEADERS, overview[custom_index]))
