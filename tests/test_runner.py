@@ -323,6 +323,42 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(runner.ConfigError, "built with libnuma"):
                 runner.check_fio_numa_support("fio", [case])
 
+    def test_numactl_policy_translation(self):
+        self.assertEqual(runner.numactl_policy_args("bind:2"), ["--membind=2"])
+        self.assertEqual(runner.numactl_policy_args("prefer:1"), ["--preferred=1"])
+        self.assertEqual(runner.numactl_policy_args("interleave:0-1"), ["--interleave=0-1"])
+        self.assertEqual(runner.numactl_policy_args("local"), ["--localalloc"])
+        self.assertEqual(runner.numactl_policy_args("default"), [])
+
+    def test_auto_numa_backend_falls_back_to_numactl(self):
+        case = copy.deepcopy(self.cases[0])
+        for job in case["job_list"]:
+            job["numa_mem_policy"] = "bind:2"
+        plan = runner.make_plan(case, "/dev/test", 10**12, 512)
+        with patch.object(runner, "fio_supports_numa", return_value=False), \
+             patch.object(runner.shutil, "which", return_value="/usr/bin/numactl"):
+            runner.configure_numa_backend([plan], "fio")
+        self.assertEqual(plan["numa_backend"], "numactl")
+        self.assertEqual(plan["numa_command_prefix"], ["/usr/bin/numactl", "--membind=2"])
+        self.assertNotIn("numa_mem_policy=", plan["fio_text"])
+
+    def test_numactl_rejects_different_job_policies(self):
+        case = copy.deepcopy(next(c for c in self.cases if c["case_id"] == "custom_jobs"))
+        case["job_list"][0]["numa_mem_policy"] = "bind:0"
+        case["job_list"][1]["numa_mem_policy"] = "bind:1"
+        plan = runner.make_plan(case, "/dev/test", 10**12, 512)
+        with patch.object(runner.shutil, "which", return_value="/usr/bin/numactl"):
+            with self.assertRaisesRegex(runner.ConfigError, "whole fio process"):
+                runner.configure_numa_backend([plan], "fio", "numactl")
+
+    def test_forced_numactl_requires_executable(self):
+        case = copy.deepcopy(self.cases[0])
+        case["job_list"][0]["numa_mem_policy"] = "bind:0"
+        plan = runner.make_plan(case, "/dev/test", 10**12, 512)
+        with patch.object(runner.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(runner.ConfigError, "not found"):
+                runner.configure_numa_backend([plan], "fio", "numactl")
+
     def test_formula_rejected_even_with_cached_value(self):
         def edit(data):
             root = ET.fromstring(data)

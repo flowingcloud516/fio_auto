@@ -151,7 +151,22 @@ numa_mem_policy=local           # 使用 worker 执行时的本地节点
 
 Cases 中的值是该用例所有独立 job 的默认策略；JobOverrides 可以逐 job 覆盖。一个 job 的所有 `numjobs` 实例共享这个策略。若不同实例需要不同内存节点，应拆成多个独立 job。
 
-正式运行前会检查配置中的 NUMA node 是否在线；fio 的 `--parse-only` 还会检查当前 fio 是否认识 NUMA 选项。fio 必须在安装了 libnuma 开发库的环境中构建，否则会报告 `Bad option <numa_mem_policy=...>`。可用 `numactl --hardware` 和 `cat /sys/devices/system/node/online` 查看节点。参数格式遵循 [fio 官方 NUMA 文档](https://fio.readthedocs.io/en/latest/fio_doc.html?highlight=numa_mem_policy)。
+正式运行前会检查配置中的 NUMA node 是否在线。默认的 `--numa-backend auto` 会先检查 fio 是否原生认识 `numa_mem_policy`；如果当前 fio 构建没有 libnuma 支持，则自动从 job 文件移除该选项，并使用外层 `numactl` 启动 fio。例如 Excel 中的 `bind:2` 会执行为 `numactl --membind=2 fio ...`。可用 `numactl --hardware` 和 `cat /sys/devices/system/node/online` 查看节点。
+
+可以显式选择后端：
+
+```bash
+# 推荐：原生 fio 可用就使用，否则自动回退到 numactl
+sudo python3 fio_excel_runner.py --excel 示例.xlsx --output fio_results --numa-backend auto
+
+# 即使 fio 原生支持，也强制使用 numactl
+sudo python3 fio_excel_runner.py --excel 示例.xlsx --output fio_results --numa-backend numactl
+
+# 只允许 fio 原生实现，不允许回退
+sudo python3 fio_excel_runner.py --excel 示例.xlsx --output fio_results --numa-backend fio
+```
+
+外层 `numactl` 的内存策略会被整个 fio 进程及其所有 job 继承，因此同一个用例内所有 job 必须填写相同的 `numa_mem_policy`；不同用例可以使用不同 node。如果需要同一用例内每个 job 绑定不同 memnode，仍需使用带 `CONFIG_LIBNUMA` 的 fio 原生后端。CPU 绑定继续由 job 文件中的 `cpus_allowed` 控制。
 
 可以先检查当前 fio 二进制是否包含 NUMA 支持：
 
@@ -159,7 +174,7 @@ Cases 中的值是该用例所有独立 job 的默认策略；JobOverrides 可�
 fio --cmdhelp=numa_mem_policy
 ```
 
-如果提示找不到该选项，即使 `fio --version` 是 3.34 或更高版本也不能使用，因为 NUMA 选项受编译时 `CONFIG_LIBNUMA` 控制。Debian/Ubuntu 构建前安装 `libnuma-dev`，RHEL/CentOS/Fedora 构建前安装 `numactl-devel`，然后重新编译 fio。runner 在 `FIO_CHECK` 阶段会执行同样的能力检查，并给出明确错误。
+如果提示找不到该选项，即使 `fio --version` 是 3.34 或更高版本也不能原生使用，因为 NUMA 选项受编译时 `CONFIG_LIBNUMA` 控制。现在使用默认 `auto` 后端时会自动改用已安装的 numactl；只有显式指定 `--numa-backend fio` 才会因此终止。
 
 ## 磁盘范围与固定参数
 

@@ -25,7 +25,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 DISK_RANGE_PERCENT = 84
 CASE_BASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
                      "cpu_start", "cpu_end", "runtime_s", "rwmixread", "notes")
@@ -467,19 +467,65 @@ def check_numa_nodes(cases, online_path=Path("/sys/devices/system/node/online"))
             fail(f"{case_id}.job_{job_index:03}: NUMA node(s) not online: {sorted(missing)}")
 
 
-def check_fio_numa_support(fio, cases):
-    if not any(job.get("numa_mem_policy") for case in cases for job in case["job_list"]):
-        return
+def fio_supports_numa(fio):
     try:
         result = subprocess.run([fio, "--cmdhelp=numa_mem_policy"], capture_output=True,
                                 text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         fail(f"Cannot query fio NUMA support: {exc}")
     output = (result.stdout or "") + (result.stderr or "")
-    if result.returncode != 0 or "numa_mem_policy" not in output:
+    return result.returncode == 0 and "numa_mem_policy" in output
+
+
+def check_fio_numa_support(fio, cases):
+    if (any(job.get("numa_mem_policy") for case in cases for job in case["job_list"])
+            and not fio_supports_numa(fio)):
         fail("This fio build does not support numa_mem_policy. The syntax bind:<node> is valid, "
              "but fio must be built with libnuma development headers (libnuma-dev or "
              "numactl-devel). Verify with: fio --cmdhelp=numa_mem_policy")
+
+
+def numactl_policy_args(policy):
+    """Translate one normalized fio NUMA policy to numactl command arguments."""
+    if policy in (None, "default"):
+        return []
+    mode, _, nodes = policy.partition(":")
+    if mode == "bind":
+        return [f"--membind={nodes}"]
+    if mode == "prefer":
+        return [f"--preferred={nodes}"]
+    if mode == "interleave":
+        return [f"--interleave={nodes}"]
+    if mode == "local":
+        return ["--localalloc"]
+    fail(f"Unsupported NUMA memory policy: {policy}")
+
+
+def configure_numa_backend(plans, fio, requested="auto", numactl="numactl"):
+    """Choose native fio or an external numactl wrapper for every case."""
+    has_policy = any(job.get("numa_mem_policy") for plan in plans for job in plan["job_list"])
+    native = fio_supports_numa(fio) if has_policy and requested in {"auto", "fio"} else False
+    if requested == "fio" and has_policy and not native:
+        check_fio_numa_support(fio, plans)
+    use_numactl = has_policy and (requested == "numactl" or (requested == "auto" and not native))
+    executable = shutil.which(numactl) if use_numactl else None
+    if use_numactl and not executable:
+        fail(f"numactl executable not found: {numactl!r}")
+    for plan in plans:
+        policies = [job.get("numa_mem_policy") for job in plan["job_list"]]
+        if not any(policies):
+            plan.update(numa_backend="none", numa_command_prefix=[])
+            continue
+        if not use_numactl:
+            plan.update(numa_backend="fio", numa_command_prefix=[])
+            continue
+        effective = [None if policy == "default" else policy for policy in policies]
+        if len(set(effective)) != 1:
+            fail(f"{plan['case_id']}: numactl applies one memory policy to the whole fio process; "
+                 "all jobs in this case must use the same numa_mem_policy")
+        args = numactl_policy_args(effective[0])
+        plan["fio_text"] = re.sub(r"(?m)^numa_mem_policy=.*\n?", "", plan["fio_text"])
+        plan.update(numa_backend="numactl", numa_command_prefix=[executable, *args] if args else [])
 
 
 def stamp():
@@ -704,13 +750,14 @@ def run_suite(plans, root, fio, timeout_grace, devices, progress):
             check_device_idle(device)
             check_cpus([plan])
             check_numa_nodes([plan])
-            command = [fio, "--output-format=normal,json", "--eta=never"]
+            command = [*plan.get("numa_command_prefix", []), fio,
+                       "--output-format=normal,json", "--eta=never"]
             if not plan["writes"]:
                 command.append("--readonly")
             command.append("jobs.fio")
             watchdog = watchdog_seconds(plan, timeout_grace)
             mode = f"time_based runtime={plan['runtime_s']}s" if plan["time_based"] else "full_range"
-            progress.step("CASE_RUN", f"Starting case; device={plan['device']}; workers={plan['total_workers']}; mode={mode}; watchdog={watchdog}s", index, plan["case_id"])
+            progress.step("CASE_RUN", f"Starting case; device={plan['device']}; workers={plan['total_workers']}; mode={mode}; numa_backend={plan.get('numa_backend', 'none')}; watchdog={watchdog}s", index, plan["case_id"])
             info.update(status="running", started_at=stamp(), command=command,
                         case_index=index, case_count=len(plans))
             write_json(folder / "run_info.json", info)
@@ -739,6 +786,9 @@ def arguments(argv=None):
     parser.add_argument("--device", help="optional override for ALL selected Excel device values, e.g. /dev/nvme1n1")
     parser.add_argument("--output", type=Path, default=Path("fio_results"))
     parser.add_argument("--fio", default="fio", help="fio executable or absolute path")
+    parser.add_argument("--numactl", default="numactl", help="numactl executable or absolute path")
+    parser.add_argument("--numa-backend", choices=("auto", "fio", "numactl"), default="auto",
+                        help="NUMA policy backend (default: auto; fall back to numactl)")
     parser.add_argument("--dry-run", action="store_true", help="generate and validate input only; no fio workload")
     parser.add_argument("--device-size-bytes", type=int, help="offline --dry-run only; assume this device capacity")
     parser.add_argument("--logical-sector-bytes", type=int, default=512, help="offline --dry-run sector size")
@@ -807,10 +857,16 @@ def prepare_and_run(args, root, progress):
         if not re.match(r"^fio-\d", version):
             fail(f"Unexpected fio executable/version: {version!r}")
         progress.note(f"fio executable={fio}; version={version}")
-        check_fio_numa_support(fio, active)
+        configure_numa_backend(plans, fio, args.numa_backend, args.numactl)
+        for plan in plans:
+            progress.note(f"{plan['case_id']}: NUMA backend={plan['numa_backend']}; "
+                          f"prefix={shlex.join(plan['numa_command_prefix']) or '(none)'}")
+    else:
+        for plan in plans:
+            plan.update(numa_backend="unresolved_dry_run", numa_command_prefix=[])
     write_json(root / "environment.json", dict(runner_version=VERSION, python=sys.version,
                platform=sys.platform, fio_version=version, devices=list(devices.values()), created_at=stamp(),
-               dry_run=args.dry_run, offline=offline))
+               dry_run=args.dry_run, offline=offline, numa_backend_requested=args.numa_backend))
     for index, plan in enumerate(plans, 1):
         progress.step("ARCHIVE", "Saving fio configuration, CPU mapping and run metadata", index, plan["case_id"])
         folder = root / f"{index:03}_{plan['case_id']}"
