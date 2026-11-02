@@ -25,7 +25,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 DISK_RANGE_PERCENT = 84
 CASE_BASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
                      "cpu_start", "cpu_end", "runtime_s", "rwmixread", "notes")
@@ -467,6 +467,21 @@ def check_numa_nodes(cases, online_path=Path("/sys/devices/system/node/online"))
             fail(f"{case_id}.job_{job_index:03}: NUMA node(s) not online: {sorted(missing)}")
 
 
+def check_fio_numa_support(fio, cases):
+    if not any(job.get("numa_mem_policy") for case in cases for job in case["job_list"]):
+        return
+    try:
+        result = subprocess.run([fio, "--cmdhelp=numa_mem_policy"], capture_output=True,
+                                text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"Cannot query fio NUMA support: {exc}")
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0 or "numa_mem_policy" not in output:
+        fail("This fio build does not support numa_mem_policy. The syntax bind:<node> is valid, "
+             "but fio must be built with libnuma development headers (libnuma-dev or "
+             "numactl-devel). Verify with: fio --cmdhelp=numa_mem_policy")
+
+
 def stamp():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
@@ -792,6 +807,7 @@ def prepare_and_run(args, root, progress):
         if not re.match(r"^fio-\d", version):
             fail(f"Unexpected fio executable/version: {version!r}")
         progress.note(f"fio executable={fio}; version={version}")
+        check_fio_numa_support(fio, active)
     write_json(root / "environment.json", dict(runner_version=VERSION, python=sys.version,
                platform=sys.platform, fio_version=version, devices=list(devices.values()), created_at=stamp(),
                dry_run=args.dry_run, offline=offline))

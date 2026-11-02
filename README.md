@@ -153,6 +153,14 @@ Cases 中的值是该用例所有独立 job 的默认策略；JobOverrides 可�
 
 正式运行前会检查配置中的 NUMA node 是否在线；fio 的 `--parse-only` 还会检查当前 fio 是否认识 NUMA 选项。fio 必须在安装了 libnuma 开发库的环境中构建，否则会报告 `Bad option <numa_mem_policy=...>`。可用 `numactl --hardware` 和 `cat /sys/devices/system/node/online` 查看节点。参数格式遵循 [fio 官方 NUMA 文档](https://fio.readthedocs.io/en/latest/fio_doc.html?highlight=numa_mem_policy)。
 
+可以先检查当前 fio 二进制是否包含 NUMA 支持：
+
+```bash
+fio --cmdhelp=numa_mem_policy
+```
+
+如果提示找不到该选项，即使 `fio --version` 是 3.34 或更高版本也不能使用，因为 NUMA 选项受编译时 `CONFIG_LIBNUMA` 控制。Debian/Ubuntu 构建前安装 `libnuma-dev`，RHEL/CentOS/Fedora 构建前安装 `numactl-devel`，然后重新编译 fio。runner 在 `FIO_CHECK` 阶段会执行同样的能力检查，并给出明确错误。
+
 ## 磁盘范围与固定参数
 
 **正式运行根据每个用例对应设备的实际容量计算，非固定容量。**前 84% 按独立 job 数量均分，各 job 访问的空间互不重叠；同一个 job 的 `numjobs` 克隆实例共享该 job 的区域。均分按独立 job 数量，不按 numjobs 加权。

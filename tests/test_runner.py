@@ -312,6 +312,17 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.ConfigError, "not online"):
             runner.check_numa_nodes([case], online)
 
+    def test_fio_numa_build_capability_check(self):
+        case = copy.deepcopy(self.cases[0])
+        case["job_list"][0]["numa_mem_policy"] = "bind:0"
+        supported = subprocess.CompletedProcess([], 0, "numa_mem_policy: NUMA memory policy\n", "")
+        with patch.object(runner.subprocess, "run", return_value=supported):
+            runner.check_fio_numa_support("fio", [case])
+        unsupported = subprocess.CompletedProcess([], 1, "", "No such command: numa_mem_policy")
+        with patch.object(runner.subprocess, "run", return_value=unsupported):
+            with self.assertRaisesRegex(runner.ConfigError, "built with libnuma"):
+                runner.check_fio_numa_support("fio", [case])
+
     def test_formula_rejected_even_with_cached_value(self):
         def edit(data):
             root = ET.fromstring(data)
