@@ -79,6 +79,49 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(all(c["effective_device"] == "/dev/sdb" for c in self.cases))
         self.assertEqual(self.cases[0]["device_source"], "command_line")
 
+    def test_system_disk_partition_parent_is_protected(self):
+        sys_block = self.root / "sys_dev_block"
+        partition = sys_block / "8_2"
+        disk = sys_block / "8_0"
+        partition.mkdir(parents=True)
+        disk.mkdir()
+        (partition / "dev").write_text("8:2\n")
+        (partition / "partition").write_text("2\n")
+        # In real sysfs the resolved partition's parent contains the whole-disk dev file.
+        (sys_block / "dev").write_text("8:0\n")
+        (disk / "dev").write_text("8:0\n")
+        mountinfo = self.root / "mountinfo"
+        mountinfo.write_text("36 25 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n")
+        resolver = lambda root, device_id: root / device_id.replace(":", "_")
+        with patch.object(runner, "block_device_entry", side_effect=resolver):
+            self.assertEqual(runner.system_disk_ids(mountinfo, sys_block), {"8:2", "8:0"})
+            with self.assertRaisesRegex(runner.ConfigError, "Refusing to test system disk"):
+                runner.check_not_system_disk({"path":"/dev/sda", "major":8, "minor":0},
+                                             mountinfo, sys_block)
+
+    def test_system_disk_traces_device_mapper_slaves(self):
+        sys_block = self.root / "sys_dev_block"
+        dm = sys_block / "253_0"
+        slave = dm / "slaves" / "sda2"
+        backing = sys_block / "8_2"
+        dm.mkdir(parents=True)
+        slave.mkdir(parents=True)
+        backing.mkdir()
+        (dm / "dev").write_text("253:0\n")
+        (slave / "dev").write_text("8:2\n")
+        (backing / "dev").write_text("8:2\n")
+        mountinfo = self.root / "mountinfo"
+        mountinfo.write_text("36 25 253:0 / / rw,relatime - ext4 /dev/mapper/root rw\n")
+        resolver = lambda root, device_id: root / device_id.replace(":", "_")
+        with patch.object(runner, "block_device_entry", side_effect=resolver):
+            self.assertEqual(runner.system_disk_ids(mountinfo, sys_block), {"253:0", "8:2"})
+
+    def test_system_disk_check_requires_root_mount(self):
+        mountinfo = self.root / "mountinfo"
+        mountinfo.write_text("36 25 0:5 / /tmp rw - tmpfs tmpfs rw\n")
+        with self.assertRaisesRegex(runner.ConfigError, "root filesystem"):
+            runner.system_disk_ids(mountinfo, self.root / "sys")
+
     def test_missing_or_invalid_device(self):
         self.cases[0]["requested_device"] = ""
         with self.assertRaisesRegex(runner.ConfigError, "missing device"):

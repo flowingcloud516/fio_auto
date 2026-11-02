@@ -25,8 +25,9 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 DISK_RANGE_PERCENT = 84
+CRITICAL_MOUNT_POINTS = {"/", "/boot", "/boot/efi", "/usr", "/var"}
 CASE_BASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
                      "cpu_start", "cpu_end", "runtime_s", "rwmixread", "notes")
 CASE_OPTIONAL_COLUMNS = ("time_based", "timeout_s", "numa_mem_policy")
@@ -397,8 +398,78 @@ def probe_device(name):
                 capacity_bytes=capacity[0], logical_sector_bytes=sector[0])
 
 
+def decode_mountinfo_path(value):
+    """Decode the octal escapes used for paths in /proc/*/mountinfo."""
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def block_device_entry(sys_dev_block, device_id):
+    return sys_dev_block / device_id
+
+
+def trace_block_device_ids(device_id, sys_dev_block=Path("/sys/dev/block"), seen=None):
+    """Return a block device plus its partition parent and recursively stacked slaves."""
+    seen = set() if seen is None else seen
+    if device_id in seen:
+        return seen
+    entry = block_device_entry(sys_dev_block, device_id)
+    if not entry.exists():
+        # major 0 is commonly overlay/tmpfs and has no physical block-device ancestry.
+        if device_id.split(":", 1)[0] != "0":
+            fail(f"Cannot trace system block device {device_id} through {sys_dev_block}")
+        return seen
+    node = entry.resolve(strict=True)
+    dev_file = node / "dev"
+    current_id = dev_file.read_text().strip() if dev_file.is_file() else device_id
+    seen.add(current_id)
+    if (node / "partition").is_file():
+        parent_dev = node.parent / "dev"
+        if parent_dev.is_file():
+            trace_block_device_ids(parent_dev.read_text().strip(), sys_dev_block, seen)
+    slaves = node / "slaves"
+    if slaves.is_dir():
+        for slave in slaves.iterdir():
+            slave_node = slave.resolve(strict=True)
+            slave_dev = slave_node / "dev"
+            if slave_dev.is_file():
+                trace_block_device_ids(slave_dev.read_text().strip(), sys_dev_block, seen)
+    return seen
+
+
+def system_disk_ids(mountinfo_path=Path("/proc/self/mountinfo"),
+                    sys_dev_block=Path("/sys/dev/block")):
+    """Find every block device backing critical operating-system mount points."""
+    protected = set()
+    found_root = False
+    try:
+        lines = mountinfo_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        fail(f"Cannot read mount table for system-disk protection: {exc}")
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6:
+            fail(f"Malformed mountinfo line while checking system disk: {line!r}")
+        mount_point = decode_mountinfo_path(fields[4])
+        if mount_point not in CRITICAL_MOUNT_POINTS:
+            continue
+        found_root = found_root or mount_point == "/"
+        protected.update(trace_block_device_ids(fields[2], sys_dev_block))
+    if not found_root:
+        fail("Cannot identify the root filesystem in /proc/self/mountinfo")
+    return protected
+
+
+def check_not_system_disk(device, mountinfo_path=Path("/proc/self/mountinfo"),
+                          sys_dev_block=Path("/sys/dev/block")):
+    target = f"{device['major']}:{device['minor']}"
+    if target in system_disk_ids(mountinfo_path, sys_dev_block):
+        fail(f"Refusing to test system disk {device['path']} ({target}); it backs a critical "
+             "mount point such as /, /boot, /boot/efi, /usr or /var")
+
+
 def check_device_idle(device):
-    """Reject mounted, swap-backed, held or host-managed zoned targets."""
+    """Reject system, mounted, swap-backed, held or host-managed zoned targets."""
+    check_not_system_disk(device)
     node = Path(f"/sys/dev/block/{device['major']}:{device['minor']}").resolve(strict=True)
     nodes = [node] + [p for p in node.iterdir() if (p / "partition").is_file()]
     ids = {(p / "dev").read_text().strip() for p in nodes}

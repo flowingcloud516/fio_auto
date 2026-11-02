@@ -389,7 +389,7 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 
 ## 设备检查和使用边界
 
-执行前检查目标是否为块设备，并拒绝已挂载的设备/子分区、活动 swap、带 device-mapper/RAID holder 的设备和 host-managed zoned 设备。每个用例开始前重新检查设备身份、容量、扇区大小和 CPU 可用范围。
+执行前检查目标是否为块设备，并拒绝系统盘、已挂载的设备/子分区、活动 swap、带 device-mapper/RAID holder 的设备和 host-managed zoned 设备。系统盘保护会从 `/`、`/boot`、`/boot/efi`、`/usr`、`/var` 的挂载设备出发，沿分区父设备和 LVM/device-mapper/RAID 的 slave 关系追溯到底层物理盘；命中后即使指定 `--allow-write` 也不能绕过。每个用例开始前都会重新检查设备身份、容量、扇区大小、系统盘关系和 CPU 可用范围。
 
 同一设备的两个本工具实例通过 `/run/lock` 锁互斥。该锁不阻止其他软件访问磁盘；应在专用空闲测试盘上运行，也不要在运行期间重新挂载设备。挂载检查以当前 Linux mount namespace 为准，推荐直接在测试主机上运行。
 
