@@ -25,7 +25,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "1.9.0"
+VERSION = "2.0.0"
 DISK_RANGE_PERCENT = 84
 CRITICAL_MOUNT_POINTS = {"/", "/boot", "/boot/efi", "/usr", "/var"}
 CASE_BASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
@@ -467,6 +467,11 @@ def check_not_system_disk(device, mountinfo_path=Path("/proc/self/mountinfo"),
              "mount point such as /, /boot, /boot/efi, /usr or /var")
 
 
+def is_system_disk(device, mountinfo_path=Path("/proc/self/mountinfo"),
+                   sys_dev_block=Path("/sys/dev/block")):
+    return f"{device['major']}:{device['minor']}" in system_disk_ids(mountinfo_path, sys_dev_block)
+
+
 def check_device_idle(device):
     """Reject system, mounted, swap-backed, held or host-managed zoned targets."""
     check_not_system_disk(device)
@@ -777,6 +782,15 @@ def watchdog_seconds(plan, timeout_grace):
     return plan["runtime_s"] + timeout_grace
 
 
+def workload_command(plan, fio):
+    command = [*plan.get("numa_command_prefix", []), fio,
+               "--output-format=normal,json", "--eta=never"]
+    if not plan["writes"]:
+        command.append("--readonly")
+    command.append("jobs.fio")
+    return command
+
+
 def run_suite(plans, root, fio, timeout_grace, devices, progress):
     records = []
     for index, plan in enumerate(plans, 1):
@@ -792,8 +806,18 @@ def run_suite(plans, root, fio, timeout_grace, devices, progress):
         progress.note(error, logging.ERROR)
         skip_pending(root, f"Suite stopped after {info.get('case_id', folder.name)}: {error}", progress)
 
+    def save_safety_skip(folder, info, reason):
+        info.update(status="skipped", skip_code="system_disk", skip_reason=reason,
+                    finished_at=stamp())
+        write_json(folder / "run_info.json", info)
+        progress.note(f"Skipped {info.get('case_id', folder.name)}: {reason}", logging.WARNING)
+
     # Parse every case before starting any disk workload.
     for index, plan, folder, info in records:
+        if info.get("status") == "skipped":
+            progress.note(f"Skipping fio preflight for {plan['case_id']}: {info.get('skip_reason')}",
+                          logging.WARNING)
+            continue
         try:
             progress.step("PREFLIGHT", "Checking fio job-file syntax", index, plan["case_id"])
             code, timed_out = execute([fio, "--parse-only", "jobs.fio"], folder,
@@ -813,19 +837,22 @@ def run_suite(plans, root, fio, timeout_grace, devices, progress):
                 save_error(folder, info, "preflight_failed", str(exc))
             raise
     for index, plan, folder, info in records:
+        if info.get("status") == "skipped":
+            continue
         try:
             progress.step("CASE_RECHECK", f"Rechecking device={plan['device']} and CPUs", index, plan["case_id"])
             device = devices[plan["device"]]
             if probe_device(device["path"]) != device:
                 fail("Device identity, capacity or sector size changed since preflight")
+            if plan["writes"] and is_system_disk(device):
+                reason = (f"system_disk: write command was not executed because target "
+                          f"{device['path']} backs a critical operating-system mount point")
+                save_safety_skip(folder, info, reason)
+                continue
             check_device_idle(device)
             check_cpus([plan])
             check_numa_nodes([plan])
-            command = [*plan.get("numa_command_prefix", []), fio,
-                       "--output-format=normal,json", "--eta=never"]
-            if not plan["writes"]:
-                command.append("--readonly")
-            command.append("jobs.fio")
+            command = workload_command(plan, fio)
             watchdog = watchdog_seconds(plan, timeout_grace)
             mode = f"time_based runtime={plan['runtime_s']}s" if plan["time_based"] else "full_range"
             progress.step("CASE_RUN", f"Starting case; device={plan['device']}; workers={plan['total_workers']}; mode={mode}; numa_backend={plan.get('numa_backend', 'none')}; watchdog={watchdog}s", index, plan["case_id"])
@@ -904,19 +931,28 @@ def prepare_and_run(args, root, progress):
     for index, case in enumerate(active, 1):
         name = case["effective_device"]
         progress.step("DEVICE_CHECK", f"Device={name}; source={case['device_source']}; offline={offline}", index, case["case_id"])
+        safety_skip_reason = None
+        case_writes = any(job["rw"] not in {"read", "randread"} for job in case["job_list"])
         if offline:
             device = dict(path=name, capacity_bytes=args.device_size_bytes,
                           logical_sector_bytes=args.logical_sector_bytes, offline=True)
         else:
             device = probe_device(name)
-            check_device_idle(device)
+            if case_writes and is_system_disk(device):
+                safety_skip_reason = (f"system_disk: write command was not executed because target "
+                                      f"{device['path']} backs a critical operating-system mount point")
+                progress.note(f"Safety skip planned: {safety_skip_reason}", logging.WARNING)
+            else:
+                check_device_idle(device)
         devices[device["path"]] = device
         progress.note(f"Device resolved: {device['path']}; capacity={device['capacity_bytes']} bytes; sector={device['logical_sector_bytes']} bytes")
         progress.step("PLAN_GENERATE", "Calculating job regions and CPU ranges", index, case["case_id"])
         plans.append(make_plan(case, device["path"], device["capacity_bytes"], device["logical_sector_bytes"]))
+        plans[-1]["safety_skip_reason"] = safety_skip_reason
         progress.note(f"Plan ready: jobs={case['jobs']}; workers={case['total_workers']}; region_end={plans[-1]['region_end_exclusive']}")
     progress.step("WRITE_GUARD", "Checking write authorization for all selected cases")
-    if not args.dry_run and any(p["writes"] for p in plans) and not args.allow_write:
+    if (not args.dry_run and any(p["writes"] and not p.get("safety_skip_reason") for p in plans)
+            and not args.allow_write):
         fail("Write/mixed cases selected: data in the first 84% may be destroyed; specify --allow-write")
     fio = shutil.which(args.fio)
     version = "not checked (dry-run)"
@@ -943,9 +979,15 @@ def prepare_and_run(args, root, progress):
         folder = root / f"{index:03}_{plan['case_id']}"
         folder.mkdir()
         (folder / "jobs.fio").write_text(plan["fio_text"], encoding="utf-8", newline="\n")
+        command_fio = fio or args.fio
+        (folder / "fio.cmd").write_text(shlex.join(workload_command(plan, command_fio)) + "\n",
+                                        encoding="utf-8", newline="\n")
         info = {k: v for k, v in plan.items() if k not in ("fio_text", "workers", "source_values")}
-        info.update(status="planned" if args.dry_run else "pending", created_at=stamp(),
-                    case_index=index, case_count=len(plans))
+        status = "planned" if args.dry_run else ("skipped" if plan.get("safety_skip_reason") else "pending")
+        info.update(status=status, created_at=stamp(), case_index=index, case_count=len(plans))
+        if plan.get("safety_skip_reason"):
+            info.update(skip_code="system_disk", skip_reason=plan["safety_skip_reason"],
+                        finished_at=stamp())
         write_json(folder / "run_info.json", info)
         with (folder / "cpu_mapping.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=("job", "clone_index", "global_worker_index", "expected_cpu"))
@@ -960,7 +1002,9 @@ def prepare_and_run(args, root, progress):
     progress.step("DEVICE_LOCK", "Acquiring locks for all selected devices")
     with ExitStack() as stack:
         # Lock each distinct device once, including aliases of the same device.
-        identities = sorted({(d['major'], d['minor']) for d in devices.values()})
+        runnable_devices = {p["device"] for p in plans if not p.get("safety_skip_reason")}
+        identities = sorted({(devices[path]['major'], devices[path]['minor'])
+                             for path in runnable_devices})
         for major, minor in identities:
             lock_path = Path(f"/run/lock/fio-excel-{major}-{minor}.lock")
             lock = stack.enter_context(lock_path.open("a"))

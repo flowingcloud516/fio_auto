@@ -469,7 +469,16 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(info["status"],"planned")
         self.assertEqual(info["selected_cpus"],[2,3,6,7,11,12,16,17])
         self.assertTrue((archive/"input.xlsx").exists())
+        command = (archive/"001_randread_4k"/"fio.cmd").read_text(encoding="utf-8")
+        self.assertEqual(command.strip(), "fio --output-format=normal,json --eta=never --readonly jobs.fio")
         self.assertFalse(list(archive.glob("**/result.txt")))
+
+    def test_workload_command_includes_numactl(self):
+        plan = runner.make_plan(self.cases[0], "/dev/test", 10**12, 512)
+        plan["numa_command_prefix"] = ["/usr/bin/numactl", "--membind=2"]
+        self.assertEqual(runner.workload_command(plan, "/usr/bin/fio"), [
+            "/usr/bin/numactl", "--membind=2", "/usr/bin/fio",
+            "--output-format=normal,json", "--eta=never", "--readonly", "jobs.fio"])
 
     def test_offline_capacity_forbidden_for_execution(self):
         with self.assertRaisesRegex(runner.ConfigError,"only with --dry-run"):
@@ -514,6 +523,31 @@ class RunnerTests(unittest.TestCase):
         second = json.loads((self.root/"002_randread_4k"/"run_info.json").read_text())
         self.assertEqual(second["status"],"skipped")
         self.assertIn("seq_read_1m",second["skip_reason"])
+
+    def test_write_to_system_disk_is_skipped_and_later_case_runs(self):
+        write_case = copy.deepcopy(next(c for c in self.cases if c["case_id"] == "precondition_write_84"))
+        read_case = copy.deepcopy(self.cases[0])
+        plans = [runner.make_plan(write_case, "/dev/test", 10**12, 512),
+                 runner.make_plan(read_case, "/dev/test", 10**12, 512)]
+        for index, plan in enumerate(plans, 1):
+            folder = self.root / f"{index:03}_{plan['case_id']}"
+            folder.mkdir()
+            runner.write_json(folder / "run_info.json", {"status":"pending", "case_id":plan["case_id"]})
+        device = {"path":"/dev/test"}
+        with patch.object(runner, "execute", side_effect=[(0,False),(0,False),(0,False)]) as execute, \
+             patch.object(runner, "probe_device", return_value=device), \
+             patch.object(runner, "is_system_disk", return_value=True), \
+             patch.object(runner, "check_device_idle"), patch.object(runner, "check_cpus"), \
+             patch.object(runner, "extract_fio_json", return_value={}):
+            self.assertEqual(runner.run_suite(plans, self.root, "fio", 60,
+                                             {"/dev/test":device}, self.new_progress()), 0)
+        self.assertEqual(execute.call_count, 3)  # two parse checks, then only the read workload
+        skipped = json.loads((self.root / "001_precondition_write_84" / "run_info.json").read_text())
+        passed = json.loads((self.root / "002_seq_read_1m" / "run_info.json").read_text())
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertEqual(skipped["skip_code"], "system_disk")
+        self.assertIn("write command was not executed", skipped["skip_reason"])
+        self.assertEqual(passed["status"], "passed")
 
     def test_parse_failure_prevents_all_workloads(self):
         plans = self.prepare_suite()
