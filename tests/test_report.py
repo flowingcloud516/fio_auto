@@ -1,4 +1,5 @@
 import json
+import csv
 from pathlib import Path
 import tempfile
 import unittest
@@ -31,6 +32,16 @@ class ReportTests(unittest.TestCase):
         runner.write_json(folder / "run_info.json", info)
         return folder
 
+    def write_cpu_csv(self, folder, rows):
+        columns = ["timestamp_utc", "elapsed_s", "interval_s", "cpu", "selected_cpus",
+                   "valid_cpus", "status", "busy_pct", "user_pct", "nice_pct",
+                   "system_pct", "idle_pct", "iowait_pct", "irq_pct", "softirq_pct",
+                   "steal_pct", "busy_cpu_s", "core_equiv"]
+        with (folder / "cpu.csv").open("w", newline="", encoding="utf-8") as target:
+            writer = csv.DictWriter(target, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
+
     def test_json_metrics_and_report(self):
         case = runner.load_cases(SAMPLE)[0]
         folder = self.make_attempt(case)
@@ -40,6 +51,17 @@ class ReportTests(unittest.TestCase):
             "write": {"iops": 0, "bw_bytes": 0, "runtime": 0, "total_ios": 0},
             "usr_cpu": 2.5, "sys_cpu": 4.5}]}
         runner.write_json(folder / "result.json", fio)
+        info = json.loads((folder / "run_info.json").read_text(encoding="utf-8"))
+        info["cpu_log"] = "cpu.csv"
+        runner.write_json(folder / "run_info.json", info)
+        self.write_cpu_csv(folder, [
+            {"interval_s": 2, "cpu": "selected_sum", "selected_cpus": 8, "valid_cpus": 8,
+             "status": "ok", "busy_pct": 50, "user_pct": 20, "system_pct": 25,
+             "idle_pct": 45, "iowait_pct": 5, "core_equiv": 4},
+            {"interval_s": 4, "cpu": "selected_sum", "selected_cpus": 8, "valid_cpus": 8,
+             "status": "ok", "busy_pct": 25, "user_pct": 10, "system_pct": 10,
+             "idle_pct": 70, "iowait_pct": 5, "core_equiv": 2},
+        ])
         output = self.root / "report.xlsx"
         self.assertEqual(report.main(["--excel", str(SAMPLE), "--results", str(self.root / "fio_results"),
                                       "--output", str(output)]), 0)
@@ -49,6 +71,36 @@ class ReportTests(unittest.TestCase):
             content = archive.read("xl/worksheets/sheet2.xml").decode()
             self.assertIn("已通过", content)
             self.assertIn(">1000.0<", content)
+            self.assertIn(">33.333<", content)
+
+    def test_cpu_metrics_are_interval_weighted_all_core_averages(self):
+        folder = self.root / "cpu"
+        folder.mkdir()
+        self.write_cpu_csv(folder, [
+            {"interval_s": 2, "cpu": "cpu0", "selected_cpus": 8, "busy_pct": 100},
+            {"interval_s": 2, "cpu": "selected_sum", "selected_cpus": 8,
+             "busy_pct": 50, "user_pct": 20, "system_pct": 25, "iowait_pct": 5,
+             "idle_pct": 45, "core_equiv": 4},
+            {"interval_s": 4, "cpu": "selected_sum", "selected_cpus": 8,
+             "busy_pct": 25, "user_pct": 10, "system_pct": 10, "iowait_pct": 5,
+             "idle_pct": 70, "core_equiv": 2},
+        ])
+        metrics, note = report.metrics_from_cpu_csv(folder / "cpu.csv")
+        self.assertEqual(note, "")
+        self.assertEqual(metrics["cpu_sample_count"], 2)
+        self.assertEqual(metrics["cpu_sampled_cpus"], 8)
+        self.assertAlmostEqual(metrics["cpu_avg_busy_pct"], 33.333, places=3)
+        self.assertAlmostEqual(metrics["cpu_avg_user_pct"], 13.333, places=3)
+        self.assertAlmostEqual(metrics["cpu_avg_core_equiv"], 2.667, places=3)
+
+    def test_missing_configured_cpu_log_is_reported(self):
+        case = runner.load_cases(SAMPLE)[0]
+        folder = self.make_attempt(case)
+        info = json.loads((folder / "run_info.json").read_text(encoding="utf-8"))
+        info["cpu_log"] = "cpu.csv"
+        runner.write_json(folder / "run_info.json", info)
+        attempts = report.scan_archives(self.root / "fio_results")
+        self.assertIn("CPU 采样日志不存在", attempts[0]["metric_error"])
 
     def test_changed_config_is_not_current_execution(self):
         case = runner.load_cases(SAMPLE)[0]
@@ -128,12 +180,18 @@ class ReportTests(unittest.TestCase):
         first.mkdir(parents=True)
         second.mkdir(parents=True)
         (first / "result.txt").write_text("read: IOPS=10, BW=1MiB/s (60MiB/60000msec)\n")
+        self.write_cpu_csv(first, [{"interval_s": 3, "cpu": "selected_sum", "selected_cpus": 16,
+                                    "busy_pct": 12.5, "user_pct": 2.5, "system_pct": 8,
+                                    "iowait_pct": 1, "idle_pct": 86.5, "core_equiv": 2}])
         runner.write_json(second / "result.json", {"fio version":"fio-3.34", "jobs":[{
             "read":{"iops":20, "bw_bytes":2097152, "runtime":60000, "total_ios":1200},
             "write":{"iops":0, "bw_bytes":0, "runtime":0, "total_ios":0}}]})
         attempts = report.scan_archives(self.root / "raw")
         self.assertEqual({a["case_id"] for a in attempts}, {"case_a", "case_b"})
         self.assertEqual(len(attempts), 2)
+        first_attempt = next(a for a in attempts if a["case_id"] == "case_a")
+        self.assertEqual(first_attempt["cpu_avg_busy_pct"], 12.5)
+        self.assertEqual(first_attempt["cpu_sampled_cpus"], 16)
 
 
 if __name__ == "__main__":

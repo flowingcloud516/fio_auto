@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 from html import escape
 import json
@@ -13,7 +14,7 @@ import zipfile
 
 from fio_excel_runner import CASE_COLUMNS, ConfigError, load_cases
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 FINAL_EXECUTED = {"passed", "failed", "timeout", "interrupted", "error"}
 BAD = {"failed", "timeout", "interrupted", "error", "preflight_failed", "skipped", "corrupt"}
 STATUS_CN = {
@@ -139,6 +140,83 @@ def metrics_from_text(path):
     return result, ""
 
 
+CPU_AVERAGE_FIELDS = {
+    "busy_pct": "cpu_avg_busy_pct",
+    "user_pct": "cpu_avg_user_pct",
+    "system_pct": "cpu_avg_system_pct",
+    "iowait_pct": "cpu_avg_iowait_pct",
+    "idle_pct": "cpu_avg_idle_pct",
+    "core_equiv": "cpu_avg_core_equiv",
+}
+
+
+def metrics_from_cpu_csv(path):
+    """Return interval-weighted all-core averages from cpu_sample.py output."""
+    totals = {output: 0.0 for output in CPU_AVERAGE_FIELDS.values()}
+    weights = {output: 0.0 for output in CPU_AVERAGE_FIELDS.values()}
+    sample_count = 0
+    sampled_cpus = None
+    try:
+        with path.open(newline="", encoding="utf-8-sig") as source:
+            reader = csv.DictReader(source)
+            if not reader.fieldnames or "cpu" not in reader.fieldnames or "interval_s" not in reader.fieldnames:
+                return {}, f"{path}: CPU CSV 缺少 cpu/interval_s 列"
+            for row_number, row in enumerate(reader, 2):
+                if row.get("cpu") != "selected_sum":
+                    continue
+                try:
+                    interval = float(row.get("interval_s") or 0)
+                except ValueError:
+                    return {}, f"{path}:{row_number}: interval_s 不是有效数字"
+                if interval <= 0:
+                    continue
+                used = False
+                for source_key, output_key in CPU_AVERAGE_FIELDS.items():
+                    raw = row.get(source_key)
+                    if raw in (None, ""):
+                        continue
+                    try:
+                        value = float(raw)
+                    except ValueError:
+                        return {}, f"{path}:{row_number}: {source_key} 不是有效数字"
+                    totals[output_key] += value * interval
+                    weights[output_key] += interval
+                    used = True
+                if not used:
+                    continue
+                sample_count += 1
+                try:
+                    cpus = int(row.get("selected_cpus") or 0)
+                except ValueError:
+                    return {}, f"{path}:{row_number}: selected_cpus 不是有效整数"
+                if cpus > 0:
+                    sampled_cpus = cpus if sampled_cpus is None else max(sampled_cpus, cpus)
+    except Exception as exc:
+        return {}, f"{path}: {exc}"
+    if not sample_count:
+        return {}, f"{path}: 未找到可汇总的 selected_sum 采样"
+    result = {key: round(totals[key] / weights[key], 3) if weights[key] else None
+              for key in totals}
+    result.update(cpu_sample_count=sample_count, cpu_sampled_cpus=sampled_cpus)
+    return result, ""
+
+
+def cpu_metrics_for_directory(directory, configured_name=None):
+    """Load a configured/adjacent CPU log; old archives without one remain valid."""
+    if configured_name:
+        path = Path(configured_name)
+        if not path.is_absolute():
+            path = directory / path
+        if not path.exists():
+            return {}, f"CPU 采样日志不存在: {path}", str(path)
+    else:
+        path = directory / "cpu.csv"
+        if not path.exists():
+            return {}, "", ""
+    metrics, error = metrics_from_cpu_csv(path)
+    return metrics, error, str(path)
+
+
 def scan_archives(root):
     attempts = []
     if not root.exists():
@@ -170,8 +248,11 @@ def scan_archives(root):
         row["result_path"] = str(result_path) if result_path else ""
         if result_path:
             seen_result_dirs.add(path.parent.resolve())
+        cpu_metrics, cpu_error, cpu_log_path = cpu_metrics_for_directory(path.parent, info.get("cpu_log"))
         row.update(metrics)
-        row["metric_error"] = metric_error
+        row.update(cpu_metrics)
+        row["cpu_log_path"] = cpu_log_path
+        row["metric_error"] = "; ".join(note for note in (metric_error, cpu_error) if note)
         attempts.append(row)
     if root.is_file():
         raw_results = [root] if root.suffix.lower() in {".txt", ".json"} else []
@@ -195,7 +276,11 @@ def scan_archives(root):
                    case_dir=str(path.parent), source=str(path), result_path=str(path),
                    created_at=modified, finished_at=modified, sort_time=modified,
                    metric_error=metric_error)
+        cpu_metrics, cpu_error, cpu_log_path = cpu_metrics_for_directory(path.parent)
         row.update(metrics)
+        row.update(cpu_metrics)
+        row["cpu_log_path"] = cpu_log_path
+        row["metric_error"] = "; ".join(note for note in (metric_error, cpu_error) if note)
         attempts.append(row)
     return attempts
 
@@ -258,6 +343,11 @@ METRIC_KEYS = [
     "read_runtime_s", "write_runtime_s", "cpu_user_pct", "cpu_sys_pct",
 ]
 
+CPU_METRIC_KEYS = [
+    "cpu_sample_count", "cpu_sampled_cpus", "cpu_avg_busy_pct", "cpu_avg_user_pct",
+    "cpu_avg_system_pct", "cpu_avg_iowait_pct", "cpu_avg_idle_pct", "cpu_avg_core_equiv",
+]
+
 
 def overview_row(case, latest, status, reason, run_count, pass_count, history_count):
     source = case.get("source_values", {})
@@ -283,6 +373,7 @@ def overview_row(case, latest, status, reason, run_count, pass_count, history_co
     values = config + [STATUS_CN.get(status, status), reason, run_count, pass_count, history_count,
                        latest.get("batch", "") if latest else "",
                        latest.get("finished_at", "") if latest else ""]
+    values += [latest.get(k) if latest else None for k in CPU_METRIC_KEYS]
     values += [latest.get(k) if latest else None for k in METRIC_KEYS]
     return values
 
@@ -292,14 +383,16 @@ def detail_row(a, match):
               "不适用" if match is None else ("是" if match else "否"),
               a.get("created_at", ""), a.get("started_at", ""),
               a.get("finished_at", ""), a.get("exit_code"), a.get("reason", ""),
-              a.get("metric_error", ""), a.get("case_dir", ""), a.get("result_path", "")]
+              a.get("metric_error", ""), a.get("case_dir", ""), a.get("result_path", ""),
+              a.get("cpu_log_path", "")]
+    values += [a.get(k) for k in CPU_METRIC_KEYS]
     values += [a.get(k) for k in METRIC_KEYS]
     return values
 
 
 OVERVIEW_HEADERS = list(CASE_COLUMNS) + ["当前状态", "状态说明", "执行次数", "成功次数", "同ID历史数",
-                                               "最新批次", "完成时间"] + METRIC_KEYS
-DETAIL_HEADERS = ["用例ID", "批次", "状态", "匹配当前配置", "创建时间", "开始时间", "完成时间", "退出码", "原因", "指标说明", "用例目录", "原始结果日志"] + METRIC_KEYS
+                                               "最新批次", "完成时间"] + CPU_METRIC_KEYS + METRIC_KEYS
+DETAIL_HEADERS = ["用例ID", "批次", "状态", "匹配当前配置", "创建时间", "开始时间", "完成时间", "退出码", "原因", "指标说明", "用例目录", "原始结果日志", "CPU采样日志"] + CPU_METRIC_KEYS + METRIC_KEYS
 EXCEPTION_HEADERS = ["用例ID", "状态", "原因", "指标说明", "批次"]
 JOB_HEADERS = ["case_id", "job_index", "rw", "bs_bytes", "iodepth", "numjobs", "rwmixread",
                "numa_mem_policy", "cpu_start", "cpu_end", "当前状态"]
