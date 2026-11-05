@@ -8,6 +8,7 @@ import copy
 import configparser
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -219,9 +220,32 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([w["expected_cpu"] for w in plan["workers"]], [2,3,3,4,2,3,3,4])
         self.assertEqual([r["cpus_allowed"] for r in plan["cpu_assignments"]],
                          ["2-3","3-4","2-3","3-4"])
-        self.assertEqual(plan["fio_text"].count("numjobs=2"), 4)
+        self.assertEqual(plan["fio_text"].count("numjobs=2"), 1)
         self.assertEqual(plan["fio_text"].count("cpus_allowed_policy=split"), 4)
         self.assertEqual(plan["fio_text"].count("[job_"), 4)
+
+    def test_common_job_options_are_promoted_to_global(self):
+        case = copy.deepcopy(self.cases[1])
+        plan = runner.make_plan(case, "/dev/test", 10**12, 512)
+        parsed = configparser.ConfigParser(interpolation=None)
+        parsed.read_string(plan["fio_text"])
+        for name in ("rw", "bs", "iodepth", "numjobs"):
+            self.assertIn(name, parsed["global"])
+            self.assertEqual(len(re.findall(rf"(?m)^{name}=", plan["fio_text"])), 1)
+        self.assertEqual(plan["estimated_io_buffer_bytes"],
+                         sum(j["numjobs"] * j["iodepth"] * j["bs_bytes"]
+                             for j in case["job_list"]))
+
+    def test_only_heterogeneous_options_stay_in_jobs(self):
+        case = copy.deepcopy(self.cases[1])
+        case["job_list"][0]["iodepth"] = 99
+        plan = runner.make_plan(case, "/dev/test", 10**12, 512)
+        parsed = configparser.ConfigParser(interpolation=None)
+        parsed.read_string(plan["fio_text"])
+        self.assertNotIn("iodepth", parsed["global"])
+        self.assertEqual(plan["fio_text"].count("iodepth="), case["jobs"])
+        for name in ("rw", "bs", "numjobs"):
+            self.assertIn(name, parsed["global"])
 
     def test_range_and_fixed_parameters(self):
         for case in self.cases:
@@ -497,6 +521,29 @@ class RunnerTests(unittest.TestCase):
         code,timed_out = runner.execute([sys.executable,"-c","import time; print('started', flush=True); time.sleep(30)"], self.root,self.root/"timeout.txt",0.5)
         self.assertTrue(timed_out)
         self.assertIsNotNone(code)
+
+    def test_resource_sample_collects_process_system_and_numa_memory(self):
+        proc = self.root / "proc"
+        process = proc / "123"
+        process.mkdir(parents=True)
+        (process / "stat").write_text("123 (fio worker) S 1 123 123 0 0\n")
+        (process / "status").write_text("VmRSS:\t1024 kB\nVmHWM:\t2048 kB\n")
+        (proc / "meminfo").write_text("MemAvailable: 9000 kB\nMemFree: 8000 kB\nSwapFree: 7000 kB\n")
+        (proc / "self").mkdir()
+        (proc / "self" / "status").write_text("VmRSS: 512 kB\n")
+        nodes = self.root / "nodes" / "node2"
+        nodes.mkdir(parents=True)
+        (nodes / "meminfo").write_text("Node 2 MemFree: 6000 kB\nNode 2 MemUsed: 4000 kB\n")
+        sample = runner.resource_sample(123, 2.5, proc, nodes.parent)
+        self.assertEqual(sample["process_count"], 1)
+        self.assertEqual(sample["fio_group_rss_kb"], 1024)
+        self.assertEqual(sample["fio_group_vmhwm_kb"], 2048)
+        self.assertEqual(sample["runner_rss_kb"], 512)
+        self.assertEqual(sample["mem_available_kb"], 9000)
+        self.assertEqual(json.loads(sample["numa_nodes"])["node2"]["MemFree_kb"], 6000)
+        output = self.root / "memory.csv"
+        runner.append_resource_sample(output, sample)
+        self.assertIn("fio_group_rss_kb", output.read_text(encoding="utf-8"))
 
     def prepare_suite(self):
         plans = [runner.make_plan(c,"/dev/test",10**12,512) for c in self.cases[:2]]

@@ -91,6 +91,8 @@ sudo python3.11 fio_excel_runner.py --excel 示例.xlsx --device /dev/sdb --dry-
 
 `JobOverrides` 可以只保留表头，也可以删除整个工作表。`Guide` 是填写说明，脚本不会读取它。
 
+生成 job 文件时，`rw`、`bs`、`iodepth`、`numjobs` 会分别判断所有独立 job 的最终有效值：某项完全一致时只写入 `[global]`，方便手工调整；某项存在 JobOverrides 差异时，该项写回每个 `[job_xxx]`。`offset`、`size`、`cpus_allowed` 始终保留在具体 job 中。
+
 ### 输入约束
 
 - 保持 `Cases`、`JobOverrides` 工作表名称及第 1 行英文字段名不变，字段列顺序可以调整。
@@ -393,6 +395,8 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 
 每个用例目录都会生成 `fio.cmd`，其中保存该用例准备执行的完整 workload 命令（包括 numactl、fio 路径和 `--readonly` 等参数），便于复核和排查。脚本仍以参数数组直接启动进程，不通过 shell 执行该文本文件。
 
+正式 workload 运行期间还会每约 2 秒追加一次 `memory.csv`，包含 fio 进程组的进程数、RSS、VmHWM 汇总，runner RSS，系统 `MemAvailable/MemFree/SwapFree`，以及每个 NUMA node 的 `MemFree/MemUsed`。`run_info.json` 会记录 `estimated_io_buffer_bytes`，其估算公式为 `sum(numjobs × iodepth × bs)`；这是定位并发 buffer 风险的量级估算，不是 fio 总内存的严格上限。语法预检不会启动该监控。
+
 同一设备的两个本工具实例通过 `/run/lock` 锁互斥。该锁不阻止其他软件访问磁盘；应在专用空闲测试盘上运行，也不要在运行期间重新挂载设备。挂载检查以当前 Linux mount namespace 为准，推荐直接在测试主机上运行。
 
 ## 已完成的验证
@@ -403,7 +407,7 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 python3.11 -B -m unittest discover -s tests -v
 ```
 
-本次在 Windows / Python 3.12.14 环境完成 39 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、缺失/非法盘符、逐设备容量计算、默认值和 job 覆盖、逐 job 连续 CPU 区间、251-254 示例、不同 numjobs 下的克隆映射、CPU 不足检查、84% 字节边界、独立 job 区域隔离、百分比/字节参数切换、numjobs 共享本 job 空间、固定参数、错误输入、离线 CLI、子进程输出/超时及失败/中断状态。新增验证覆盖早期 Excel 失败日志、主流程阶段及用例序号、PID/定时等待日志、首个错误即终止、已完成结果保留、剩余用例跳过、预检启动失败和归档失败状态。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
+本次在 Windows / Python 3.12.14 环境完成 67 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、内存/NUMA 采样、系统盘保护、逐 job 连续 CPU 区间、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
 
 三张工作表已渲染检查。尚未在 Python 3.11.6 本机或 Linux/libaio/真实块设备上执行集成测试；目标机正式运行会先进行 fio 参数解析检查。请先在目标机把一个只读用例改为短时长进行环境验证。
 
