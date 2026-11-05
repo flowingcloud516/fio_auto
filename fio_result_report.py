@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an Excel coverage and performance report from fio runner archives."""
+"""Build an Excel performance report from fio results, optionally checking design coverage."""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,7 @@ import zipfile
 
 from fio_excel_runner import CASE_COLUMNS, ConfigError, load_cases
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 FINAL_EXECUTED = {"passed", "failed", "timeout", "interrupted", "error"}
 BAD = {"failed", "timeout", "interrupted", "error", "preflight_failed", "skipped", "corrupt"}
 STATUS_CN = {
@@ -21,7 +21,7 @@ STATUS_CN = {
     "error": "运行错误", "preflight_failed": "预检失败", "skipped": "已跳过",
     "planned": "仅配置验证", "pending": "等待执行", "running": "执行未完成",
     "never_run": "从未执行", "config_changed": "配置已变更", "disabled": "已禁用",
-    "corrupt": "结果损坏",
+    "corrupt": "结果损坏", "collected": "已收集（执行状态未知）",
 }
 
 
@@ -143,6 +143,7 @@ def scan_archives(root):
     attempts = []
     if not root.exists():
         return attempts
+    seen_result_dirs = set()
     for path in sorted(root.rglob("run_info.json")):
         info, error = read_json(path)
         batch = path.parent.parent
@@ -156,13 +157,45 @@ def scan_archives(root):
         row["sort_time"] = info.get("finished_at") or info.get("started_at") or info.get("created_at") or batch.name
         metrics, metric_error = ({}, "")
         if (path.parent / "result.json").exists():
-            metrics, metric_error = metrics_from_json(path.parent / "result.json")
+            result_path = path.parent / "result.json"
+            metrics, metric_error = metrics_from_json(result_path)
         elif (path.parent / "result.txt").exists() and info.get("status") in FINAL_EXECUTED:
-            metrics, metric_error = metrics_from_text(path.parent / "result.txt")
+            result_path = path.parent / "result.txt"
+            metrics, metric_error = metrics_from_text(result_path)
         elif info.get("status") == "passed":
+            result_path = None
             metric_error = "结果目录缺少 result.json/result.txt，无法提取性能指标"
+        else:
+            result_path = None
+        row["result_path"] = str(result_path) if result_path else ""
+        if result_path:
+            seen_result_dirs.add(path.parent.resolve())
         row.update(metrics)
         row["metric_error"] = metric_error
+        attempts.append(row)
+    if root.is_file():
+        raw_results = [root] if root.suffix.lower() in {".txt", ".json"} else []
+    else:
+        raw_results = sorted(list(root.rglob("result.json")) + list(root.rglob("result.txt")))
+    # Prefer result.json when both formats exist in one directory.
+    chosen = {}
+    for path in raw_results:
+        chosen.setdefault(path.parent.resolve(), path)
+        if path.name == "result.json":
+            chosen[path.parent.resolve()] = path
+    for directory, path in chosen.items():
+        if directory in seen_result_dirs:
+            continue
+        metrics, metric_error = (metrics_from_json(path) if path.suffix.lower() == ".json"
+                                 else metrics_from_text(path))
+        case_id = re.sub(r"^\d+_", "", path.parent.name) if root.is_dir() else path.stem
+        modified = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).isoformat(timespec="seconds")
+        row = dict(case_id=case_id or path.stem, status="collected", reason="未提供 run_info.json，执行状态未知",
+                   batch=path.parent.parent.name if root.is_dir() else "standalone",
+                   case_dir=str(path.parent), source=str(path), result_path=str(path),
+                   created_at=modified, finished_at=modified, sort_time=modified,
+                   metric_error=metric_error)
+        row.update(metrics)
         attempts.append(row)
     return attempts
 
@@ -206,6 +239,18 @@ def build_rows(cases, attempts):
     return overview, details, exceptions, job_rows
 
 
+def build_result_only_rows(attempts):
+    details = [detail_row(attempt, None) for attempt in attempts]
+    exceptions = []
+    for attempt in attempts:
+        status = attempt.get("status", "corrupt")
+        if status in BAD or attempt.get("metric_error"):
+            exceptions.append([attempt.get("case_id", ""), STATUS_CN.get(status, status),
+                               attempt.get("reason", ""), attempt.get("metric_error", ""),
+                               attempt.get("batch", "")])
+    return details, exceptions
+
+
 METRIC_KEYS = [
     "read_iops", "write_iops", "read_bw_mib_s", "write_bw_mib_s",
     "read_clat_avg_us", "read_clat_p95_us", "read_clat_p99_us", "read_clat_p999_us", "read_clat_p9999_us",
@@ -244,16 +289,17 @@ def overview_row(case, latest, status, reason, run_count, pass_count, history_co
 
 def detail_row(a, match):
     values = [a.get("case_id"), a.get("batch"), STATUS_CN.get(a.get("status"), a.get("status")),
-              "是" if match else "否", a.get("created_at", ""), a.get("started_at", ""),
+              "不适用" if match is None else ("是" if match else "否"),
+              a.get("created_at", ""), a.get("started_at", ""),
               a.get("finished_at", ""), a.get("exit_code"), a.get("reason", ""),
-              a.get("metric_error", ""), a.get("case_dir", "")]
+              a.get("metric_error", ""), a.get("case_dir", ""), a.get("result_path", "")]
     values += [a.get(k) for k in METRIC_KEYS]
     return values
 
 
 OVERVIEW_HEADERS = list(CASE_COLUMNS) + ["当前状态", "状态说明", "执行次数", "成功次数", "同ID历史数",
                                                "最新批次", "完成时间"] + METRIC_KEYS
-DETAIL_HEADERS = ["用例ID", "批次", "状态", "匹配当前配置", "创建时间", "开始时间", "完成时间", "退出码", "原因", "指标说明", "用例目录"] + METRIC_KEYS
+DETAIL_HEADERS = ["用例ID", "批次", "状态", "匹配当前配置", "创建时间", "开始时间", "完成时间", "退出码", "原因", "指标说明", "用例目录", "原始结果日志"] + METRIC_KEYS
 EXCEPTION_HEADERS = ["用例ID", "状态", "原因", "指标说明", "批次"]
 JOB_HEADERS = ["case_id", "job_index", "rw", "bs_bytes", "iodepth", "numjobs", "rwmixread",
                "numa_mem_policy", "cpu_start", "cpu_end", "当前状态"]
@@ -318,8 +364,9 @@ def write_xlsx(path, sheets):
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--excel", required=True, type=Path, help="current design workbook")
-    parser.add_argument("--results", required=True, type=Path, help="fio_results archive root")
+    parser.add_argument("--excel", type=Path, help="optional current design workbook for coverage checks")
+    parser.add_argument("--results", required=True, type=Path,
+                        help="fio_results archive root, a directory of raw results, or one result.txt/result.json")
     parser.add_argument("--output", type=Path, default=Path("统计结果.xlsx"))
     return parser.parse_args(argv)
 
@@ -328,18 +375,26 @@ def main(argv=None):
     if sys.version_info < (3, 11):
         raise ConfigError("Python 3.11 or newer is required")
     args = arguments(argv)
-    cases = load_cases(args.excel)
     attempts = scan_archives(args.results)
-    overview, details, exceptions, job_rows = build_rows(cases, attempts)
-    summary = [["生成时间", dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")],
-               ["设计用例数", len(cases)], ["启用用例数", sum(c["enabled"] for c in cases)],
-               ["扫描执行记录数", len(attempts)], ["异常/待执行用例数", len(exceptions)],
-               ["设计文件", str(args.excel.resolve())], ["结果目录", str(args.results.resolve())]]
-    write_xlsx(args.output, [("统计概览", ["项目", "值"], summary),
-                             ("用例覆盖", OVERVIEW_HEADERS, overview),
-                             ("Job配置", JOB_HEADERS, job_rows),
-                             ("运行明细", DETAIL_HEADERS, details),
-                             ("异常清单", EXCEPTION_HEADERS, exceptions)])
+    if args.excel:
+        cases = load_cases(args.excel)
+        overview, details, exceptions, job_rows = build_rows(cases, attempts)
+        summary = [["生成时间", dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")],
+                   ["模式", "用例覆盖对照"], ["设计用例数", len(cases)],
+                   ["启用用例数", sum(c["enabled"] for c in cases)],
+                   ["扫描执行记录数", len(attempts)], ["异常/待执行用例数", len(exceptions)],
+                   ["设计文件", str(args.excel.resolve())], ["结果目录", str(args.results.resolve())]]
+        sheets = [("统计概览", ["项目", "值"], summary),
+                  ("用例覆盖", OVERVIEW_HEADERS, overview), ("Job配置", JOB_HEADERS, job_rows),
+                  ("运行明细", DETAIL_HEADERS, details), ("异常清单", EXCEPTION_HEADERS, exceptions)]
+    else:
+        details, exceptions = build_result_only_rows(attempts)
+        summary = [["生成时间", dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")],
+                   ["模式", "仅结果收集（未提供用例Excel）"], ["扫描结果数", len(attempts)],
+                   ["无法解析/异常数", len(exceptions)], ["结果来源", str(args.results.resolve())]]
+        sheets = [("统计概览", ["项目", "值"], summary),
+                  ("运行明细", DETAIL_HEADERS, details), ("异常清单", EXCEPTION_HEADERS, exceptions)]
+    write_xlsx(args.output, sheets)
     print(f"Report written: {args.output.resolve()}")
     return 0
 

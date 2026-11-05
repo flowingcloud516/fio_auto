@@ -291,6 +291,18 @@ python3.11 fio_result_report.py \
   --output 统计结果.xlsx
 ```
 
+`--excel` 是可选参数。不提供 Excel 时不判断用例覆盖情况，只扫描已有归档或原始 fio 日志：
+
+```bash
+# 扫描整个结果目录（支持有或没有 run_info.json）
+python3.11 fio_result_report.py --results ./fio_results --output 统计结果.xlsx
+
+# 也可以直接提供单个 fio 原始日志
+python3.11 fio_result_report.py --results result.txt --output 统计结果.xlsx
+```
+
+无 Excel 模式生成 `统计概览`、`运行明细`、`异常清单`。如果只有 `result.txt`/`result.json` 而没有 `run_info.json`，报告会提取可识别的性能汇总，将状态标记为“已收集（执行状态未知）”，并在“原始结果日志”列保留源文件路径；不会推测用例是否覆盖或执行是否成功。
+
 报表包含 `统计概览`、`用例覆盖`、`Job配置`、`运行明细` 和 `异常清单`。`用例覆盖` 每个用例一行，前面的配置列与输入 Excel 的 `Cases` 列一一对应，`rw`、`bs`、`iodepth`、`jobs`、`numjobs`、CPU 范围、运行模式等均为独立列，可直接使用 Excel 筛选；后面附带最新状态、执行次数和性能汇总。多个 job 的某项有效参数完全相同时只显示一个值，不重复拼接；存在差异时显示“多值（见Job配置）”。`Job配置` 每个独立 job 一行，展开 `JobOverrides` 后的有效参数，便于筛选多 job 用例。`运行明细` 保留扫描到的全部历史记录。
 
 以下规则用于判断覆盖情况：
@@ -407,7 +419,7 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 python3.11 -B -m unittest discover -s tests -v
 ```
 
-本次在 Windows / Python 3.12.14 环境完成 67 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、内存/NUMA 采样、系统盘保护、逐 job 连续 CPU 区间、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
+本次在 Windows / Python 3.12.14 环境完成 69 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、内存/NUMA 采样、系统盘保护、逐 job 连续 CPU 区间、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
 
 三张工作表已渲染检查。尚未在 Python 3.11.6 本机或 Linux/libaio/真实块设备上执行集成测试；目标机正式运行会先进行 fio 参数解析检查。请先在目标机把一个只读用例改为短时长进行环境验证。
 

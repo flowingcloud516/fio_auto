@@ -105,6 +105,36 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(metrics["read_clat_p9999_us"], 50)
         self.assertEqual(note, "")
 
+    def test_report_without_excel_from_one_raw_result(self):
+        source = self.root / "my_raw_result.txt"
+        source.write_text("read: IOPS=1000, BW=10MiB/s (600MiB/60000msec)\n", encoding="utf-8")
+        output = self.root / "raw_report.xlsx"
+        self.assertEqual(report.main(["--results", str(source), "--output", str(output)]), 0)
+        attempts = report.scan_archives(source)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["status"], "collected")
+        self.assertEqual(attempts[0]["read_iops"], 1000)
+        self.assertEqual(attempts[0]["result_path"], str(source))
+        with zipfile.ZipFile(output) as archive:
+            self.assertIn("xl/worksheets/sheet3.xml", archive.namelist())
+            self.assertNotIn("xl/worksheets/sheet4.xml", archive.namelist())
+            detail = archive.read("xl/worksheets/sheet2.xml").decode()
+            self.assertIn("已收集（执行状态未知）", detail)
+            self.assertIn("my_raw_result.txt", detail)
+
+    def test_report_without_excel_scans_raw_result_directories(self):
+        first = self.root / "raw" / "001_case_a"
+        second = self.root / "raw" / "002_case_b"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+        (first / "result.txt").write_text("read: IOPS=10, BW=1MiB/s (60MiB/60000msec)\n")
+        runner.write_json(second / "result.json", {"fio version":"fio-3.34", "jobs":[{
+            "read":{"iops":20, "bw_bytes":2097152, "runtime":60000, "total_ios":1200},
+            "write":{"iops":0, "bw_bytes":0, "runtime":0, "total_ios":0}}]})
+        attempts = report.scan_archives(self.root / "raw")
+        self.assertEqual({a["case_id"] for a in attempts}, {"case_a", "case_b"})
+        self.assertEqual(len(attempts), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
