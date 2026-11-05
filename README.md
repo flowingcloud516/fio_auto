@@ -250,6 +250,9 @@ fio_results/
     001_seq_read_1m/
       jobs.fio                    # 完整 fio job 描述文件
       cpu_mapping.csv             # 预期实例到 CPU 的对应关系
+      cpu.csv                     # 每约 3 秒采集全部逻辑 CPU 的 /proc/stat 指标
+      cpu_sampler.log             # CPU 采样器自身输出及异常
+      memory.csv                  # fio 进程组、runner、系统和 NUMA 内存采样
       run_info.json               # 用例序号、配置、状态、命令、退出码、失败阶段/原因和时间
       parse_check.txt             # fio --parse-only 的输出
       result.txt                  # fio 原生 normal + JSON 组合输出，完整保留原始 stdout/stderr
@@ -409,6 +412,8 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 
 正式 workload 运行期间还会每约 2 秒追加一次 `memory.csv`，包含 fio 进程组的进程数、RSS、VmHWM 汇总，runner RSS，系统 `MemAvailable/MemFree/SwapFree`，以及每个 NUMA node 的 `MemFree/MemUsed`。`run_info.json` 会记录 `estimated_io_buffer_bytes`，其估算公式为 `sum(numjobs × iodepth × bs)`；这是定位并发 buffer 风险的量级估算，不是 fio 总内存的严格上限。语法预检不会启动该监控。
 
+每个正式 workload 还会并行启动项目内置的 `cpu_sample.py`，默认每 3 秒读取一次 `/proc/stat`。runner 不传 `--cpus`，因此会采集系统可见的全部逻辑 CPU，而不只采集 fio 绑定范围。每个用例目录保存 `cpu.csv` 和 `cpu_sampler.log`，采样间隔及采样器命令同时记录在 `run_info.json`。可以用 `--cpu-sample-interval 1` 调整间隔，或用 `--cpu-sampler /path/to/cpu_sample.py` 指定兼容脚本。采样仅覆盖正式 fio workload，不覆盖 `--parse-only` 预检。
+
 同一设备的两个本工具实例通过 `/run/lock` 锁互斥。该锁不阻止其他软件访问磁盘；应在专用空闲测试盘上运行，也不要在运行期间重新挂载设备。挂载检查以当前 Linux mount namespace 为准，推荐直接在测试主机上运行。
 
 ## 已完成的验证
@@ -419,7 +424,7 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 python3.11 -B -m unittest discover -s tests -v
 ```
 
-本次在 Windows / Python 3.12.14 环境完成 69 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、内存/NUMA 采样、系统盘保护、逐 job 连续 CPU 区间、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
+本次在 Windows / Python 3.12.14 环境完成 71 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、全部逻辑 CPU 采样、内存/NUMA 采样、系统盘保护、逐 job 连续 CPU 区间、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
 
 三张工作表已渲染检查。尚未在 Python 3.11.6 本机或 Linux/libaio/真实块设备上执行集成测试；目标机正式运行会先进行 fio 参数解析检查。请先在目标机把一个只读用例改为短时长进行环境验证。
 

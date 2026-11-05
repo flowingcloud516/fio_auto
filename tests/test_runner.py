@@ -21,6 +21,7 @@ HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 import fio_excel_runner as runner
+import cpu_sample
 
 SAMPLE = PROJECT_ROOT / "示例.xlsx"
 
@@ -503,6 +504,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.workload_command(plan, "/usr/bin/fio"), [
             "/usr/bin/numactl", "--membind=2", "/usr/bin/fio",
             "--output-format=normal,json", "--eta=never", "--readonly", "jobs.fio"])
+
+    def test_cpu_sampler_defaults_to_all_cores_and_three_seconds(self):
+        args = runner.arguments(["--excel", str(SAMPLE)])
+        self.assertEqual(args.cpu_sample_interval, 3.0)
+        self.assertEqual(args.cpu_sampler.name, "cpu_sample.py")
+        previous = {0:[10,0,5,80,1,0,1,0], 1:[20,0,10,60,2,1,2,0]}
+        current = {0:[20,0,10,160,2,0,2,0], 1:[30,0,20,120,3,2,4,0]}
+        rows = cpu_sample.sample_rows(previous, current, {0,1}, 3.0, 100,
+                                      "2026-01-01T00:00:00+00:00", 3.0)
+        self.assertEqual([row["cpu"] for row in rows], ["cpu0", "cpu1", "selected_sum"])
+        self.assertEqual(rows[-1]["selected_cpus"], 2)
+
+    def test_cpu_sampler_command_does_not_filter_cpus(self):
+        process = unittest.mock.Mock(pid=321)
+        log_path = self.root / "cpu_sampler.log"
+        with patch.object(runner.subprocess, "Popen", return_value=process) as popen:
+            started_process, log, command = runner.start_cpu_sampler(
+                PROJECT_ROOT / "cpu_sample.py", 3.0, self.root, self.new_progress())
+        self.assertIs(started_process, process)
+        self.assertNotIn("--cpus", command)
+        self.assertEqual(command[-4:], ["--interval", "3.0", "--output", "cpu.csv"])
+        self.assertEqual(popen.call_args.kwargs["cwd"], self.root)
+        log.close()
+        self.assertTrue(log_path.exists())
 
     def test_offline_capacity_forbidden_for_execution(self):
         with self.assertRaisesRegex(runner.ConfigError,"only with --dry-run"):

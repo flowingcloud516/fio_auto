@@ -25,7 +25,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DISK_RANGE_PERCENT = 84
 CRITICAL_MOUNT_POINTS = {"/", "/boot", "/boot/efi", "/usr", "/var"}
 CASE_BASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
@@ -882,7 +882,47 @@ def workload_command(plan, fio):
     return command
 
 
-def run_suite(plans, root, fio, timeout_grace, devices, progress):
+def start_cpu_sampler(script, interval, folder, progress):
+    command = [sys.executable, str(script), "--interval", str(interval),
+               "--output", "cpu.csv"]
+    log = (folder / "cpu_sampler.log").open("wb")
+    try:
+        process = subprocess.Popen(command, cwd=folder, stdout=log, stderr=subprocess.STDOUT,
+                                   start_new_session=(os.name == "posix"))
+    except BaseException:
+        log.close()
+        raise
+    progress.note(f"CPU sampler started: pid={process.pid}; interval={interval}s; all logical CPUs; "
+                  f"output={folder / 'cpu.csv'}")
+    return process, log, command
+
+
+def stop_cpu_sampler(process, log, progress):
+    try:
+        if process.poll() is None:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGINT)
+            else:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        code = process.returncode
+        progress.note(f"CPU sampler stopped: pid={process.pid}; exit_code={code}",
+                      logging.INFO if code == 0 else logging.WARNING)
+        return code
+    finally:
+        log.close()
+
+
+def run_suite(plans, root, fio, timeout_grace, devices, progress,
+              cpu_sampler=None, cpu_sample_interval=3.0):
     records = []
     for index, plan in enumerate(plans, 1):
         folder = root / f"{index:03}_{plan['case_id']}"
@@ -950,9 +990,20 @@ def run_suite(plans, root, fio, timeout_grace, devices, progress):
             progress.step("CASE_RUN", f"Starting case; device={plan['device']}; workers={plan['total_workers']}; mode={mode}; numa_backend={plan.get('numa_backend', 'none')}; estimated_io_buffers={estimate_mib:.1f}MiB; watchdog={watchdog}s", index, plan["case_id"])
             info.update(status="running", started_at=stamp(), command=command,
                         case_index=index, case_count=len(plans), memory_log="memory.csv")
+            sampler = None
+            if cpu_sampler is not None:
+                sampler = start_cpu_sampler(cpu_sampler, cpu_sample_interval, folder, progress)
+                info.update(cpu_log="cpu.csv", cpu_sampler_log="cpu_sampler.log",
+                            cpu_sample_interval_s=cpu_sample_interval,
+                            cpu_sampler_command=sampler[2])
             write_json(folder / "run_info.json", info)
-            code, timed_out = execute(command, folder, folder / "result.txt", watchdog, progress,
-                                      folder / "memory.csv")
+            try:
+                code, timed_out = execute(command, folder, folder / "result.txt", watchdog, progress,
+                                          folder / "memory.csv")
+            finally:
+                if sampler is not None:
+                    info["cpu_sampler_exit_code"] = stop_cpu_sampler(sampler[0], sampler[1], progress)
+                    write_json(folder / "run_info.json", info)
             if code or timed_out:
                 error = f"fio workload failed; exit_code={code}; timeout={timed_out}; see {folder / 'result.txt'}"
                 save_error(folder, info, "timeout" if timed_out else "failed", error, code)
@@ -986,6 +1037,10 @@ def arguments(argv=None):
     parser.add_argument("--allow-write", action="store_true", help="authorize destructive writes for selected write/mixed cases")
     parser.add_argument("--case", action="append", help="select case_id; repeat to select several enabled cases")
     parser.add_argument("--timeout-grace", type=int, default=60, help="watchdog seconds in addition to runtime (default 60)")
+    parser.add_argument("--cpu-sampler", type=Path, default=Path(__file__).with_name("cpu_sample.py"),
+                        help="CPU sampling script (default: bundled cpu_sample.py)")
+    parser.add_argument("--cpu-sample-interval", type=float, default=3.0,
+                        help="all-core CPU sampling interval in seconds (default: 3)")
     return parser.parse_args(argv)
 
 
@@ -993,6 +1048,8 @@ def prepare_and_run(args, root, progress):
     progress.step("CONFIG_READ", f"Reading Excel: {args.excel.resolve()}")
     if args.timeout_grace < 1:
         fail("--timeout-grace must be positive")
+    if not math.isfinite(args.cpu_sample_interval) or args.cpu_sample_interval <= 0:
+        fail("--cpu-sample-interval must be finite and positive")
     shutil.copyfile(args.excel, root / "input.xlsx")
     cases = load_cases(args.excel)
     progress.note(f"Loaded {len(cases)} worksheet cases")
@@ -1056,6 +1113,8 @@ def prepare_and_run(args, root, progress):
     if not args.dry_run:
         if not fio:
             fail("fio executable not found; install the Flexible I/O Tester")
+        if not args.cpu_sampler.is_file():
+            fail(f"CPU sampler script not found: {args.cpu_sampler}")
         version = subprocess.check_output([fio, "--version"], text=True, timeout=10).strip()
         if not re.match(r"^fio-\d", version):
             fail(f"Unexpected fio executable/version: {version!r}")
@@ -1109,7 +1168,8 @@ def prepare_and_run(args, root, progress):
             except BlockingIOError:
                 fail(f"Another fio_excel_runner instance is testing device {major}:{minor}")
             progress.note(f"Device lock acquired: {major}:{minor}")
-        return run_suite(plans, root, fio, args.timeout_grace, devices, progress)
+        return run_suite(plans, root, fio, args.timeout_grace, devices, progress,
+                         args.cpu_sampler.resolve(), args.cpu_sample_interval)
 
 
 def main(argv=None):
