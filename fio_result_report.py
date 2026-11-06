@@ -14,7 +14,7 @@ import zipfile
 
 from fio_excel_runner import CASE_COLUMNS, ConfigError, load_cases
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 FINAL_EXECUTED = {"passed", "failed", "timeout", "interrupted", "error"}
 BAD = {"failed", "timeout", "interrupted", "error", "preflight_failed", "skipped", "corrupt"}
 STATUS_CN = {
@@ -140,29 +140,141 @@ def metrics_from_text(path):
     return result, ""
 
 
-CPU_AVERAGE_FIELDS = {
+CPU_PERCENTAGE_FIELDS = {
     "busy_pct": "cpu_avg_busy_pct",
     "user_pct": "cpu_avg_user_pct",
     "system_pct": "cpu_avg_system_pct",
     "iowait_pct": "cpu_avg_iowait_pct",
     "idle_pct": "cpu_avg_idle_pct",
-    "core_equiv": "cpu_avg_core_equiv",
 }
 
 
-def metrics_from_cpu_csv(path):
-    """Return interval-weighted all-core averages from cpu_sample.py output."""
-    totals = {output: 0.0 for output in CPU_AVERAGE_FIELDS.values()}
-    weights = {output: 0.0 for output in CPU_AVERAGE_FIELDS.values()}
-    sample_count = 0
-    sampled_cpus = None
+def parse_cpu_list(value):
+    """Expand fio cpus_allowed syntax such as 2-3,6,8-9."""
+    cpus = set()
+    for item in str(value).split(","):
+        item = item.strip()
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", item)
+        if not match:
+            raise ValueError(f"无效 cpus_allowed 值: {value!r}")
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if end < start:
+            raise ValueError(f"cpus_allowed 范围倒序: {item}")
+        if end - start > 1048576:
+            raise ValueError(f"cpus_allowed 范围过大: {item}")
+        cpus.update(range(start, end + 1))
+    if not cpus:
+        raise ValueError("cpus_allowed 为空")
+    return cpus
+
+
+def compact_cpu_list(cpus):
+    values = sorted(set(cpus))
+    if not values:
+        return ""
+    ranges = []
+    start = previous = values[0]
+    for cpu in values[1:]:
+        if cpu == previous + 1:
+            previous = cpu
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = cpu
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def cpus_from_jobs_fio(path):
+    """Return the union of effective per-job cpus_allowed values in a fio job file."""
+    global_cpus = None
+    jobs = []
+    current = None
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line_number, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
+            section = re.fullmatch(r"\[([^]]+)]", stripped)
+            if section:
+                current = {"name": section.group(1), "cpus": None}
+                if current["name"].lower() != "global":
+                    jobs.append(current)
+                continue
+            key, separator, value = stripped.partition("=")
+            if separator and key.strip().lower() == "cpus_allowed":
+                if current is None:
+                    raise ValueError(f"第 {line_number} 行的 cpus_allowed 不在 section 内")
+                parsed = parse_cpu_list(value.strip())
+                if current["name"].lower() == "global":
+                    global_cpus = parsed
+                else:
+                    current["cpus"] = parsed
+    except Exception as exc:
+        return set(), f"{path}: {exc}"
+    unbound = [job["name"] for job in jobs if job["cpus"] is None and global_cpus is None]
+    if unbound:
+        return set(), f"{path}: job 未配置 cpus_allowed: {','.join(unbound)}"
+    effective = set()
+    for job in jobs:
+        value = job["cpus"] if job["cpus"] is not None else global_cpus
+        if value:
+            effective.update(value)
+    if not jobs and global_cpus:
+        effective.update(global_cpus)
+    if not effective:
+        return set(), f"{path}: 未找到有效的 cpus_allowed"
+    return effective, ""
+
+
+def bound_cpus_for_directory(directory, info=None):
+    """Prefer jobs.fio, with run_info cpu_assignments as a compatibility fallback."""
+    jobs_path = directory / "jobs.fio"
+    jobs_error = ""
+    if jobs_path.exists():
+        cpus, jobs_error = cpus_from_jobs_fio(jobs_path)
+        if cpus:
+            return cpus, "jobs.fio", ""
+    assignments = (info or {}).get("cpu_assignments")
+    if isinstance(assignments, list):
+        try:
+            cpus = set()
+            for assignment in assignments:
+                if isinstance(assignment, dict) and assignment.get("cpus_allowed") not in (None, ""):
+                    cpus.update(parse_cpu_list(assignment["cpus_allowed"]))
+            if cpus:
+                note = (f"{jobs_error}; 已回退到 run_info.cpu_assignments"
+                        if jobs_error else "")
+                return cpus, "run_info.cpu_assignments", note
+        except ValueError as exc:
+            fallback_error = f"run_info.cpu_assignments: {exc}"
+            jobs_error = "; ".join(x for x in (jobs_error, fallback_error) if x)
+    error = jobs_error or f"{directory}: 无法从 jobs.fio 或 run_info.json 确定绑定 CPU"
+    return set(), "", error
+
+
+def metrics_from_cpu_csv(path, bound_cpus):
+    """Return interval-weighted averages for only the CPUs bound by the fio job file."""
+    requested = set(bound_cpus)
+    if not requested:
+        return {}, "绑定 CPU 集合为空"
+    totals = {output: 0.0 for output in CPU_PERCENTAGE_FIELDS.values()}
+    weights = {output: 0.0 for output in CPU_PERCENTAGE_FIELDS.values()}
+    samples = {}
+    sampled_cpus = set()
+    seen_rows = set()
     try:
         with path.open(newline="", encoding="utf-8-sig") as source:
             reader = csv.DictReader(source)
             if not reader.fieldnames or "cpu" not in reader.fieldnames or "interval_s" not in reader.fieldnames:
                 return {}, f"{path}: CPU CSV 缺少 cpu/interval_s 列"
             for row_number, row in enumerate(reader, 2):
-                if row.get("cpu") != "selected_sum":
+                cpu_match = re.fullmatch(r"cpu(\d+)", row.get("cpu") or "")
+                if not cpu_match:
+                    continue
+                cpu = int(cpu_match.group(1))
+                if cpu not in requested or row.get("status") not in (None, "", "ok"):
                     continue
                 try:
                     interval = float(row.get("interval_s") or 0)
@@ -170,8 +282,16 @@ def metrics_from_cpu_csv(path):
                     return {}, f"{path}:{row_number}: interval_s 不是有效数字"
                 if interval <= 0:
                     continue
+                sample_key = row.get("timestamp_utc") or row.get("elapsed_s")
+                if not sample_key:
+                    return {}, f"{path}:{row_number}: 缺少 timestamp_utc/elapsed_s，无法识别采样点"
+                pair = (sample_key, cpu)
+                if pair in seen_rows:
+                    return {}, f"{path}:{row_number}: CPU {cpu} 在同一采样点重复出现"
+                seen_rows.add(pair)
                 used = False
-                for source_key, output_key in CPU_AVERAGE_FIELDS.items():
+                busy_pct = None
+                for source_key, output_key in CPU_PERCENTAGE_FIELDS.items():
                     raw = row.get(source_key)
                     if raw in (None, ""):
                         continue
@@ -181,28 +301,38 @@ def metrics_from_cpu_csv(path):
                         return {}, f"{path}:{row_number}: {source_key} 不是有效数字"
                     totals[output_key] += value * interval
                     weights[output_key] += interval
+                    if source_key == "busy_pct":
+                        busy_pct = value
                     used = True
                 if not used:
                     continue
-                sample_count += 1
+                raw_core_equiv = row.get("core_equiv")
                 try:
-                    cpus = int(row.get("selected_cpus") or 0)
+                    core_equiv = (float(raw_core_equiv) if raw_core_equiv not in (None, "")
+                                  else (busy_pct / 100.0 if busy_pct is not None else 0.0))
                 except ValueError:
-                    return {}, f"{path}:{row_number}: selected_cpus 不是有效整数"
-                if cpus > 0:
-                    sampled_cpus = cpus if sampled_cpus is None else max(sampled_cpus, cpus)
+                    return {}, f"{path}:{row_number}: core_equiv 不是有效数字"
+                sample = samples.setdefault(sample_key, {"interval": interval, "core_equiv": 0.0})
+                sample["interval"] = max(sample["interval"], interval)
+                sample["core_equiv"] += core_equiv
+                sampled_cpus.add(cpu)
     except Exception as exc:
         return {}, f"{path}: {exc}"
-    if not sample_count:
-        return {}, f"{path}: 未找到可汇总的 selected_sum 采样"
+    if not samples:
+        return {}, f"{path}: 未找到绑定 CPU {compact_cpu_list(requested)} 的可汇总采样"
     result = {key: round(totals[key] / weights[key], 3) if weights[key] else None
               for key in totals}
-    result.update(cpu_sample_count=sample_count, cpu_sampled_cpus=sampled_cpus)
-    return result, ""
+    core_weight = sum(sample["interval"] for sample in samples.values())
+    result["cpu_avg_core_equiv"] = round(
+        sum(sample["core_equiv"] * sample["interval"] for sample in samples.values()) / core_weight, 3)
+    result.update(cpu_sample_count=len(samples), cpu_sampled_cpus=len(sampled_cpus))
+    missing = requested - sampled_cpus
+    error = (f"{path}: CPU CSV 缺少绑定 CPU {compact_cpu_list(missing)} 的有效采样" if missing else "")
+    return result, error
 
 
-def cpu_metrics_for_directory(directory, configured_name=None):
-    """Load a configured/adjacent CPU log; old archives without one remain valid."""
+def cpu_metrics_for_directory(directory, configured_name=None, info=None):
+    """Load CPU data and summarize only CPUs named by jobs.fio/run_info."""
     if configured_name:
         path = Path(configured_name)
         if not path.is_absolute():
@@ -213,8 +343,17 @@ def cpu_metrics_for_directory(directory, configured_name=None):
         path = directory / "cpu.csv"
         if not path.exists():
             return {}, "", ""
-    metrics, error = metrics_from_cpu_csv(path)
-    return metrics, error, str(path)
+    bound_cpus, binding_source, binding_error = bound_cpus_for_directory(directory, info)
+    metrics = {
+        "cpu_binding_source": binding_source,
+        "cpu_bound_cpus": compact_cpu_list(bound_cpus),
+        "cpu_bound_cpu_count": len(bound_cpus) if bound_cpus else None,
+    }
+    cpu_error = ""
+    if bound_cpus:
+        values, cpu_error = metrics_from_cpu_csv(path, bound_cpus)
+        metrics.update(values)
+    return metrics, "; ".join(x for x in (binding_error, cpu_error) if x), str(path)
 
 
 def scan_archives(root):
@@ -248,7 +387,8 @@ def scan_archives(root):
         row["result_path"] = str(result_path) if result_path else ""
         if result_path:
             seen_result_dirs.add(path.parent.resolve())
-        cpu_metrics, cpu_error, cpu_log_path = cpu_metrics_for_directory(path.parent, info.get("cpu_log"))
+        cpu_metrics, cpu_error, cpu_log_path = cpu_metrics_for_directory(
+            path.parent, info.get("cpu_log"), info)
         row.update(metrics)
         row.update(cpu_metrics)
         row["cpu_log_path"] = cpu_log_path
@@ -344,8 +484,9 @@ METRIC_KEYS = [
 ]
 
 CPU_METRIC_KEYS = [
-    "cpu_sample_count", "cpu_sampled_cpus", "cpu_avg_busy_pct", "cpu_avg_user_pct",
-    "cpu_avg_system_pct", "cpu_avg_iowait_pct", "cpu_avg_idle_pct", "cpu_avg_core_equiv",
+    "cpu_binding_source", "cpu_bound_cpus", "cpu_bound_cpu_count", "cpu_sample_count",
+    "cpu_sampled_cpus", "cpu_avg_busy_pct", "cpu_avg_user_pct", "cpu_avg_system_pct",
+    "cpu_avg_iowait_pct", "cpu_avg_idle_pct", "cpu_avg_core_equiv",
 ]
 
 

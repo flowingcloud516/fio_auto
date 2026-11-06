@@ -304,18 +304,24 @@ python3.11 fio_result_report.py --results ./fio_results --output 统计结果.xl
 python3.11 fio_result_report.py --results result.txt --output 统计结果.xlsx
 ```
 
-无 Excel 模式生成 `统计概览`、`运行明细`、`异常清单`。如果只有 `result.txt`/`result.json` 而没有 `run_info.json`，报告会提取可识别的性能汇总，将状态标记为“已收集（执行状态未知）”，并在“原始结果日志”列保留源文件路径；不会推测用例是否覆盖或执行是否成功。如果结果文件旁边同时存在 `cpu.csv`，也会一并汇总 CPU 指标。
+无 Excel 模式生成 `统计概览`、`运行明细`、`异常清单`。如果只有 `result.txt`/`result.json` 而没有 `run_info.json`，报告会提取可识别的性能汇总，将状态标记为“已收集（执行状态未知）”，并在“原始结果日志”列保留源文件路径；不会推测用例是否覆盖或执行是否成功。如果结果文件旁边同时存在 `cpu.csv` 和 `jobs.fio`，也会按 job 文件中的 CPU 绑定汇总 CPU 指标。
 
-报表包含 `统计概览`、`用例覆盖`、`Job配置`、`运行明细` 和 `异常清单`。`用例覆盖` 每个用例一行，前面的配置列与输入 Excel 的 `Cases` 列一一对应，`rw`、`bs`、`iodepth`、`jobs`、`numjobs`、CPU 范围、运行模式等均为独立列，可直接使用 Excel 筛选；执行结果列后面是本用例的系统 CPU 平均指标，再后面是 fio 性能汇总。多个 job 的某项有效参数完全相同时只显示一个值，不重复拼接；存在差异时显示“多值（见Job配置）”。`Job配置` 每个独立 job 一行，展开 `JobOverrides` 后的有效参数，便于筛选多 job 用例。`运行明细` 保留扫描到的全部历史记录，并给出原始结果和 CPU 采样日志路径。
+报表包含 `统计概览`、`用例覆盖`、`Job配置`、`运行明细` 和 `异常清单`。`用例覆盖` 每个用例一行，前面的配置列与输入 Excel 的 `Cases` 列一一对应，`rw`、`bs`、`iodepth`、`jobs`、`numjobs`、CPU 范围、运行模式等均为独立列，可直接使用 Excel 筛选；执行结果列后面是本用例绑定 CPU 的平均指标，再后面是 fio 性能汇总。多个 job 的某项有效参数完全相同时只显示一个值，不重复拼接；存在差异时显示“多值（见Job配置）”。`Job配置` 每个独立 job 一行，展开 `JobOverrides` 后的有效参数，便于筛选多 job 用例。`运行明细` 保留扫描到的全部历史记录，并给出原始结果和 CPU 采样日志路径。
 
-CPU 汇总列来自每个用例的 `cpu.csv`：
+CPU 汇总优先解析每个用例归档中的 `jobs.fio`，合并所有 job 的有效 `cpus_allowed` 并去重，再从 `cpu.csv` 中只选择对应的 `cpuN` 行。不会使用 Excel 的 `cpu_start..cpu_end` 直接推断，因为为分散 job 而留出的空闲核也位于这个范围内。只有旧归档缺少 `jobs.fio` 时，才回退读取 `run_info.json` 的 `cpu_assignments`。
 
-- `cpu_sample_count`：参与汇总的 `selected_sum` 采样点数量。
-- `cpu_sampled_cpus`：采样覆盖的逻辑 CPU 数量；runner 默认采集 `/proc/stat` 中的全部逻辑 CPU。
-- `cpu_avg_busy_pct`、`cpu_avg_user_pct`、`cpu_avg_system_pct`、`cpu_avg_iowait_pct`、`cpu_avg_idle_pct`：以实际 `interval_s` 加权的全核平均百分比。
-- `cpu_avg_core_equiv`：平均忙碌核数。例如 128 个逻辑 CPU 的 `cpu_avg_busy_pct=25%`，通常约等于 `cpu_avg_core_equiv=32`。
+例如 `jobs.fio` 中四个 job 分别写着 `2-3`、`6-7`、`11-12`、`16-17`，报表只统计这 8 个逻辑 CPU，不会把范围中未绑定的 4、5、8、9、10、13、14、15 算进去。多个 job 重复绑定同一个 CPU 时，该 CPU 只计一次。
 
-这些列表示**整个系统全部逻辑 CPU**在该用例执行期间的平均值，不等于 fio 绑定核的单核利用率。末尾原有的 `cpu_user_pct`、`cpu_sys_pct` 来自 fio 结果，反映 fio job 报告的进程 CPU 指标，二者不能直接混用。历史归档没有 `cpu.csv` 时 CPU 汇总列保持空白；`run_info.json` 已声明 CPU 日志但文件缺失或内容损坏时，会写入“指标说明”并列入异常清单。
+CPU 汇总列包括：
+
+- `cpu_binding_source`：绑定信息来源，正常为 `jobs.fio`，兼容回退时为 `run_info.cpu_assignments`。
+- `cpu_bound_cpus`、`cpu_bound_cpu_count`：实际纳入统计的 CPU 列表和去重后的数量。
+- `cpu_sample_count`：参与汇总的时间采样点数量。
+- `cpu_sampled_cpus`：在 `cpu.csv` 中实际找到有效数据的绑定 CPU 数量。
+- `cpu_avg_busy_pct`、`cpu_avg_user_pct`、`cpu_avg_system_pct`、`cpu_avg_iowait_pct`、`cpu_avg_idle_pct`：对绑定 CPU 和实际 `interval_s` 同时加权的平均百分比。
+- `cpu_avg_core_equiv`：这些绑定 CPU 的平均忙碌核数。例如绑定 8 个逻辑 CPU 且 `cpu_avg_busy_pct=25%`，通常约等于 `cpu_avg_core_equiv=2`。
+
+runner 仍采集系统可见的全部逻辑 CPU，因此同一份 `cpu.csv` 可以在统计时重新选择绑定核；报表中的上述平均值只代表本用例绑定集合。末尾原有的 `cpu_user_pct`、`cpu_sys_pct` 来自 fio 结果，反映 fio job 报告的进程 CPU 指标，二者不能直接混用。历史归档没有 `cpu.csv` 时 CPU 汇总列保持空白；CPU 日志、绑定信息缺失或内容损坏时，会写入“指标说明”并列入异常清单，不会静默改为全系统平均。
 
 仓库提供 [结果统计样例](examples/结果统计样例.xlsx)，可以直接查看列顺序、筛选方式和两个示例用例的 CPU 汇总效果。
 
@@ -435,7 +441,7 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 python3.11 -B -m unittest discover -s tests -v
 ```
 
-本次在 Windows / Python 3.12.14 环境完成 73 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、全部逻辑 CPU 采样及加权汇总、内存/NUMA 采样、系统盘保护、逐 job 连续 CPU 区间、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
+本次在 Windows / Python 3.12.14 环境完成 75 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、全部逻辑 CPU 采样、`jobs.fio` 绑定核解析及加权汇总、缺少绑定信息时禁止回退全系统平均、内存/NUMA 采样、系统盘保护、逐 job 连续 CPU 区间、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
 
 结果统计样例的五张工作表已渲染检查，未发现公式错误或标题截断。尚未在 Python 3.11.6 本机或 Linux/libaio/真实块设备上执行集成测试；目标机正式运行会先进行 fio 参数解析检查。请先在目标机把一个只读用例改为短时长进行环境验证。
 

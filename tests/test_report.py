@@ -42,6 +42,9 @@ class ReportTests(unittest.TestCase):
             writer.writeheader()
             writer.writerows(rows)
 
+    def write_jobs_fio(self, folder, text):
+        (folder / "jobs.fio").write_text(text, encoding="utf-8")
+
     def test_json_metrics_and_report(self):
         case = runner.load_cases(SAMPLE)[0]
         folder = self.make_attempt(case)
@@ -54,13 +57,18 @@ class ReportTests(unittest.TestCase):
         info = json.loads((folder / "run_info.json").read_text(encoding="utf-8"))
         info["cpu_log"] = "cpu.csv"
         runner.write_json(folder / "run_info.json", info)
+        self.write_jobs_fio(folder, "[global]\nfilename=/dev/test\n[job_001]\ncpus_allowed=2\n")
         self.write_cpu_csv(folder, [
-            {"interval_s": 2, "cpu": "selected_sum", "selected_cpus": 8, "valid_cpus": 8,
+            {"timestamp_utc": "2026-09-23T04:00:02+00:00", "interval_s": 2,
+             "cpu": "cpu0", "status": "ok", "busy_pct": 100},
+            {"timestamp_utc": "2026-09-23T04:00:02+00:00", "interval_s": 2,
+             "cpu": "cpu2", "selected_cpus": 8, "valid_cpus": 1,
              "status": "ok", "busy_pct": 50, "user_pct": 20, "system_pct": 25,
-             "idle_pct": 45, "iowait_pct": 5, "core_equiv": 4},
-            {"interval_s": 4, "cpu": "selected_sum", "selected_cpus": 8, "valid_cpus": 8,
+             "idle_pct": 45, "iowait_pct": 5, "core_equiv": .5},
+            {"timestamp_utc": "2026-09-23T04:00:06+00:00", "interval_s": 4,
+             "cpu": "cpu2", "selected_cpus": 8, "valid_cpus": 1,
              "status": "ok", "busy_pct": 25, "user_pct": 10, "system_pct": 10,
-             "idle_pct": 70, "iowait_pct": 5, "core_equiv": 2},
+             "idle_pct": 70, "iowait_pct": 5, "core_equiv": .25},
         ])
         output = self.root / "report.xlsx"
         self.assertEqual(report.main(["--excel", str(SAMPLE), "--results", str(self.root / "fio_results"),
@@ -72,26 +80,49 @@ class ReportTests(unittest.TestCase):
             self.assertIn("已通过", content)
             self.assertIn(">1000.0<", content)
             self.assertIn(">33.333<", content)
+            self.assertIn("jobs.fio", content)
 
-    def test_cpu_metrics_are_interval_weighted_all_core_averages(self):
+    def test_cpu_metrics_use_only_bound_cpus_and_weight_intervals(self):
         folder = self.root / "cpu"
         folder.mkdir()
         self.write_cpu_csv(folder, [
-            {"interval_s": 2, "cpu": "cpu0", "selected_cpus": 8, "busy_pct": 100},
-            {"interval_s": 2, "cpu": "selected_sum", "selected_cpus": 8,
+            {"timestamp_utc": "t1", "interval_s": 2, "cpu": "cpu0", "busy_pct": 100},
+            {"timestamp_utc": "t1", "interval_s": 2, "cpu": "cpu2",
              "busy_pct": 50, "user_pct": 20, "system_pct": 25, "iowait_pct": 5,
-             "idle_pct": 45, "core_equiv": 4},
-            {"interval_s": 4, "cpu": "selected_sum", "selected_cpus": 8,
+             "idle_pct": 45, "core_equiv": .5},
+            {"timestamp_utc": "t1", "interval_s": 2, "cpu": "cpu3",
+             "busy_pct": 30, "user_pct": 10, "system_pct": 15, "iowait_pct": 5,
+             "idle_pct": 65, "core_equiv": .3},
+            {"timestamp_utc": "t2", "interval_s": 4, "cpu": "cpu2",
              "busy_pct": 25, "user_pct": 10, "system_pct": 10, "iowait_pct": 5,
-             "idle_pct": 70, "core_equiv": 2},
+             "idle_pct": 70, "core_equiv": .25},
+            {"timestamp_utc": "t2", "interval_s": 4, "cpu": "cpu3",
+             "busy_pct": 15, "user_pct": 5, "system_pct": 5, "iowait_pct": 5,
+             "idle_pct": 80, "core_equiv": .15},
+            {"timestamp_utc": "t2", "interval_s": 4, "cpu": "selected_sum",
+             "busy_pct": 90, "core_equiv": 7.2},
         ])
-        metrics, note = report.metrics_from_cpu_csv(folder / "cpu.csv")
+        metrics, note = report.metrics_from_cpu_csv(folder / "cpu.csv", {2, 3})
         self.assertEqual(note, "")
         self.assertEqual(metrics["cpu_sample_count"], 2)
-        self.assertEqual(metrics["cpu_sampled_cpus"], 8)
-        self.assertAlmostEqual(metrics["cpu_avg_busy_pct"], 33.333, places=3)
-        self.assertAlmostEqual(metrics["cpu_avg_user_pct"], 13.333, places=3)
-        self.assertAlmostEqual(metrics["cpu_avg_core_equiv"], 2.667, places=3)
+        self.assertEqual(metrics["cpu_sampled_cpus"], 2)
+        self.assertAlmostEqual(metrics["cpu_avg_busy_pct"], 26.667, places=3)
+        self.assertAlmostEqual(metrics["cpu_avg_user_pct"], 10, places=3)
+        self.assertAlmostEqual(metrics["cpu_avg_core_equiv"], .533, places=3)
+
+    def test_jobs_fio_binding_parser_and_run_info_fallback(self):
+        cpus, note = report.cpus_from_jobs_fio(ROOT / "examples" / "example_jobs.fio")
+        self.assertEqual(note, "")
+        self.assertEqual(report.compact_cpu_list(cpus), "2-3,6-7,11-12,16-17")
+
+        folder = self.root / "fallback"
+        folder.mkdir()
+        cpus, source, note = report.bound_cpus_for_directory(folder, {
+            "cpu_assignments": [{"cpus_allowed": "4-5"}, {"cpus_allowed": "9"}]
+        })
+        self.assertEqual(cpus, {4, 5, 9})
+        self.assertEqual(source, "run_info.cpu_assignments")
+        self.assertEqual(note, "")
 
     def test_missing_configured_cpu_log_is_reported(self):
         case = runner.load_cases(SAMPLE)[0]
@@ -101,6 +132,19 @@ class ReportTests(unittest.TestCase):
         runner.write_json(folder / "run_info.json", info)
         attempts = report.scan_archives(self.root / "fio_results")
         self.assertIn("CPU 采样日志不存在", attempts[0]["metric_error"])
+
+    def test_cpu_log_without_binding_is_not_reported_as_system_average(self):
+        folder = self.root / "unbound"
+        folder.mkdir()
+        self.write_cpu_csv(folder, [
+            {"timestamp_utc": "t1", "interval_s": 3, "cpu": "cpu0",
+             "busy_pct": 90, "user_pct": 10, "system_pct": 70,
+             "iowait_pct": 2, "idle_pct": 8, "core_equiv": .9},
+        ])
+        metrics, note, path = report.cpu_metrics_for_directory(folder)
+        self.assertNotIn("cpu_avg_busy_pct", metrics)
+        self.assertIn("无法从 jobs.fio 或 run_info.json 确定绑定 CPU", note)
+        self.assertEqual(path, str(folder / "cpu.csv"))
 
     def test_changed_config_is_not_current_execution(self):
         case = runner.load_cases(SAMPLE)[0]
@@ -180,9 +224,15 @@ class ReportTests(unittest.TestCase):
         first.mkdir(parents=True)
         second.mkdir(parents=True)
         (first / "result.txt").write_text("read: IOPS=10, BW=1MiB/s (60MiB/60000msec)\n")
-        self.write_cpu_csv(first, [{"interval_s": 3, "cpu": "selected_sum", "selected_cpus": 16,
-                                    "busy_pct": 12.5, "user_pct": 2.5, "system_pct": 8,
-                                    "iowait_pct": 1, "idle_pct": 86.5, "core_equiv": 2}])
+        self.write_jobs_fio(first, "[global]\nfilename=/dev/test\n[job_001]\ncpus_allowed=4-5\n")
+        self.write_cpu_csv(first, [
+            {"timestamp_utc": "t1", "interval_s": 3, "cpu": "cpu4",
+             "busy_pct": 10, "user_pct": 2, "system_pct": 7, "iowait_pct": 1,
+             "idle_pct": 89, "core_equiv": .1},
+            {"timestamp_utc": "t1", "interval_s": 3, "cpu": "cpu5",
+             "busy_pct": 15, "user_pct": 3, "system_pct": 9, "iowait_pct": 1,
+             "idle_pct": 84, "core_equiv": .15},
+        ])
         runner.write_json(second / "result.json", {"fio version":"fio-3.34", "jobs":[{
             "read":{"iops":20, "bw_bytes":2097152, "runtime":60000, "total_ios":1200},
             "write":{"iops":0, "bw_bytes":0, "runtime":0, "total_ios":0}}]})
@@ -191,7 +241,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
         first_attempt = next(a for a in attempts if a["case_id"] == "case_a")
         self.assertEqual(first_attempt["cpu_avg_busy_pct"], 12.5)
-        self.assertEqual(first_attempt["cpu_sampled_cpus"], 16)
+        self.assertEqual(first_attempt["cpu_sampled_cpus"], 2)
+        self.assertEqual(first_attempt["cpu_bound_cpus"], "4-5")
 
 
 if __name__ == "__main__":
