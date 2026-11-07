@@ -25,7 +25,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 DISK_RANGE_PERCENT = 84
 CRITICAL_MOUNT_POINTS = {"/", "/boot", "/boot/efi", "/usr", "/var"}
 CASE_BASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
@@ -260,36 +260,18 @@ def load_cases(path):
 
 
 def allocate_job_cpus(start, end, counts):
-    """One contiguous interval of exactly numjobs CPUs per independent job.
-
-    With spare CPUs, spread the intervals using gaps. With oversubscription,
-    reuse the least-loaded contiguous window; never wrap one interval.
-    """
+    """Allocate one non-overlapping interval per job, sequentially from start."""
     available = end - start + 1
-    if not counts or any(n < 1 or n > available for n in counts):
+    if not counts or any(n < 1 for n in counts):
         fail(f"Each job's numjobs must be within 1..{available} for CPU range {start}-{end}")
-    result = []
-    total = sum(counts)
-    if total <= available:
-        spare = available - total
-        used = 0
-        for index, count in enumerate(counts):
-            gap = index * spare // (len(counts)-1) if len(counts) > 1 else 0
-            first = start + used + gap
-            result.append(list(range(first, first+count)))
-            used += count
-    else:
-        loads = [0] * available
-        for count in counts:
-            current = best_load = sum(loads[:count])
-            best_start = 0
-            for first in range(1, available-count+1):
-                current += loads[first+count-1] - loads[first-1]
-                if current < best_load:
-                    best_load, best_start = current, first
-            result.append(list(range(start+best_start, start+best_start+count)))
-            for cpu in range(best_start, best_start+count):
-                loads[cpu] += 1
+    required = sum(counts)
+    if required > available:
+        fail(f"CPU range {start}-{end} has {available} CPUs, but all jobs' numjobs require "
+             f"{required} distinct CPUs")
+    result, first = [], start
+    for count in counts:
+        result.append(list(range(first, first + count)))
+        first += count
     return result
 
 
@@ -382,11 +364,27 @@ def make_plan(case, device, capacity, sector):
             mapping.append(dict(job=name, clone_index=clone, global_worker_index=worker,
                                 expected_cpu=assigned_cpus[worker % len(assigned_cpus)]))
             worker += 1
+    required_cpus = sum(j["numjobs"] for j in case["job_list"])
+    cpu_binding = dict(
+        schema_version=1,
+        case_id=case["case_id"],
+        allocation_policy="sequential_from_cpu_start",
+        requested_cpu_range=dict(start=case["cpu_start"], end=case["cpu_end"],
+                                 available_cpu_count=case["cpu_end"] - case["cpu_start"] + 1),
+        required_cpu_count=required_cpus,
+        bound_cpu_count=len(cpus),
+        bound_cpus=cpus,
+        bound_cpu_range=(str(cpus[0]) if len(cpus) == 1 else f"{cpus[0]}-{cpus[-1]}"),
+        unused_cpu_count=case["cpu_end"] - case["cpu_start"] + 1 - len(cpus),
+        jobs=[dict(assignment, cpus=group)
+              for assignment, group in zip(cpu_assignments, job_cpus)],
+    )
     return dict(**case, device=device, capacity_bytes=capacity, logical_sector_bytes=sector,
                 limit_84_percent_bytes=limit, region_end_exclusive=size,
                 range_policy="independent_jobs_disjoint_clones_shared", job_regions=regions,
                 cpu_assignments=cpu_assignments,
                 region_alignment_bytes=alignment, selected_cpus=cpus, workers=mapping,
+                cpu_binding=cpu_binding,
                 global_job_options=global_job_options,
                 estimated_io_buffer_bytes=sum(j["numjobs"] * j["iodepth"] * j["bs_bytes"]
                                               for j in case["job_list"]),
@@ -1137,9 +1135,12 @@ def prepare_and_run(args, root, progress):
         command_fio = fio or args.fio
         (folder / "fio.cmd").write_text(shlex.join(workload_command(plan, command_fio)) + "\n",
                                         encoding="utf-8", newline="\n")
-        info = {k: v for k, v in plan.items() if k not in ("fio_text", "workers", "source_values")}
+        write_json(folder / "cpu_binding.json", plan["cpu_binding"])
+        info = {k: v for k, v in plan.items()
+                if k not in ("fio_text", "workers", "source_values", "cpu_binding")}
         status = "planned" if args.dry_run else ("skipped" if plan.get("safety_skip_reason") else "pending")
-        info.update(status=status, created_at=stamp(), case_index=index, case_count=len(plans))
+        info.update(status=status, created_at=stamp(), case_index=index, case_count=len(plans),
+                    cpu_binding_file="cpu_binding.json")
         if plan.get("safety_skip_reason"):
             info.update(skip_code="system_disk", skip_reason=plan["safety_skip_reason"],
                         finished_at=stamp())

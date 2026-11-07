@@ -180,18 +180,20 @@ class RunnerTests(unittest.TestCase):
                                   [1,min(length,4),min(length,2)]]
                 for counts in counts_options:
                     end = start + length - 1
+                    if sum(counts) > length:
+                        with self.assertRaisesRegex(runner.ConfigError, "distinct CPUs"):
+                            runner.allocate_job_cpus(start, end, counts)
+                        continue
                     groups = runner.allocate_job_cpus(start, end, counts)
                     self.assertEqual(len(groups),len(counts))
+                    cursor = start
                     for cpus, count in zip(groups,counts):
                         self.assertEqual(len(cpus),count)
-                        self.assertEqual(cpus,list(range(cpus[0],cpus[0]+count)))
+                        self.assertEqual(cpus,list(range(cursor,cursor+count)))
                         self.assertTrue(all(start <= x <= end for x in cpus))
-                    if sum(counts) <= length:
-                        flattened = [cpu for group in groups for cpu in group]
-                        self.assertEqual(len(flattened),len(set(flattened)))
-                        self.assertEqual(groups[0][0],start)
-                        if len(groups)>1:
-                            self.assertEqual(groups[-1][-1],end)
+                        cursor += count
+                    flattened = [cpu for group in groups for cpu in group]
+                    self.assertEqual(flattened,list(range(start,start+sum(counts))))
 
     def test_contiguous_range_251_example(self):
         case = copy.deepcopy(self.cases[0])
@@ -210,20 +212,37 @@ class RunnerTests(unittest.TestCase):
     def test_heterogeneous_jobs_cpu_mapping(self):
         case = next(c for c in self.cases if c["case_id"] == "custom_jobs")
         plan = runner.make_plan(case,"/dev/test",10**12,512)
-        self.assertEqual([r["cpus_allowed"] for r in plan["cpu_assignments"]],["2","15-17"])
+        self.assertEqual([r["cpus_allowed"] for r in plan["cpu_assignments"]],["2","3-5"])
         # fio split uses the global instance index, so the second job rotates.
-        self.assertEqual([w["expected_cpu"] for w in plan["workers"]],[2,16,17,15])
+        self.assertEqual([w["expected_cpu"] for w in plan["workers"]],[2,4,5,3])
 
     def test_cpu_mapping_across_distinct_jobs(self):
         case = copy.deepcopy(self.cases[1])
-        case["cpu_start"], case["cpu_end"] = 2, 4
+        case["cpu_start"], case["cpu_end"] = 2, 9
         plan = runner.make_plan(case, "/dev/test", 10**12, 512)
-        self.assertEqual([w["expected_cpu"] for w in plan["workers"]], [2,3,3,4,2,3,3,4])
+        self.assertEqual([w["expected_cpu"] for w in plan["workers"]], list(range(2,10)))
         self.assertEqual([r["cpus_allowed"] for r in plan["cpu_assignments"]],
-                         ["2-3","3-4","2-3","3-4"])
+                         ["2-3","4-5","6-7","8-9"])
         self.assertEqual(plan["fio_text"].count("numjobs=2"), 1)
         self.assertEqual(plan["fio_text"].count("cpus_allowed_policy=split"), 4)
         self.assertEqual(plan["fio_text"].count("[job_"), 4)
+
+    def test_cpu_binding_uses_only_required_prefix_and_has_manifest(self):
+        case = copy.deepcopy(self.cases[1])
+        case["cpu_start"], case["cpu_end"] = 1, 100
+        for job in case["job_list"]:
+            job["numjobs"] = 4
+        case["total_workers"] = 16
+        plan = runner.make_plan(case, "/dev/test", 10**12, 512)
+        self.assertEqual([row["cpus_allowed"] for row in plan["cpu_assignments"]],
+                         ["1-4", "5-8", "9-12", "13-16"])
+        manifest = plan["cpu_binding"]
+        self.assertEqual(manifest["allocation_policy"], "sequential_from_cpu_start")
+        self.assertEqual(manifest["requested_cpu_range"],
+                         {"start":1, "end":100, "available_cpu_count":100})
+        self.assertEqual(manifest["bound_cpu_count"], 16)
+        self.assertEqual(manifest["bound_cpus"], list(range(1,17)))
+        self.assertEqual(manifest["unused_cpu_count"], 84)
 
     def test_common_job_options_are_promoted_to_global(self):
         case = copy.deepcopy(self.cases[1])
@@ -300,6 +319,7 @@ class RunnerTests(unittest.TestCase):
                 case["job_list"] = [dict(job_index=i+1, rw="read", bs_bytes=4096 if i%2 else 8192,
                                          iodepth=32, numjobs=2, rwmixread=None) for i in range(count)]
                 case["total_workers"] = count * 2
+                case["cpu_end"] = case["cpu_start"] + case["total_workers"] - 1
                 plan = runner.make_plan(case, "/dev/test", capacity, 4096)
                 parsed = configparser.ConfigParser(interpolation=None)
                 parsed.read_string(plan["fio_text"])
@@ -492,7 +512,13 @@ class RunnerTests(unittest.TestCase):
         archive = next(self.root.iterdir())
         info = json.loads((archive/"001_randread_4k"/"run_info.json").read_text())
         self.assertEqual(info["status"],"planned")
-        self.assertEqual(info["selected_cpus"],[2,3,6,7,11,12,16,17])
+        self.assertEqual(info["selected_cpus"],list(range(2,10)))
+        self.assertEqual(info["cpu_binding_file"],"cpu_binding.json")
+        binding = json.loads((archive/"001_randread_4k"/"cpu_binding.json").read_text())
+        self.assertEqual(binding["bound_cpu_count"],8)
+        self.assertEqual(binding["bound_cpus"],list(range(2,10)))
+        self.assertEqual([job["cpus_allowed"] for job in binding["jobs"]],
+                         ["2-3","4-5","6-7","8-9"])
         self.assertTrue((archive/"input.xlsx").exists())
         command = (archive/"001_randread_4k"/"fio.cmd").read_text(encoding="utf-8")
         self.assertEqual(command.strip(), "fio --output-format=normal,json --eta=never --readonly jobs.fio")

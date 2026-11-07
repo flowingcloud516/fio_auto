@@ -39,7 +39,7 @@ rw=randread
 bs=4096
 iodepth=32
 numjobs=2
-cpus_allowed=6-7
+cpus_allowed=4-5
 cpus_allowed_policy=split
 
 [job_003]
@@ -51,7 +51,7 @@ rw=randread
 bs=4096
 iodepth=32
 numjobs=2
-cpus_allowed=11-12
+cpus_allowed=6-7
 cpus_allowed_policy=split
 
 [job_004]
@@ -63,5 +63,5 @@ rw=randread
 bs=4096
 iodepth=32
 numjobs=2
-cpus_allowed=16-17
+cpus_allowed=8-9
 cpus_allowed_policy=split

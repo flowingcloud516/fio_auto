@@ -128,15 +128,15 @@ cpus_allowed_policy=split
 
 设输入闭区间有 C 个 CPU，各 job 的实例数为 n1、n2…，合计 W：
 
-- 每个 n 必须不超过 C；单个 job 要 4 个核而输入范围只有 3 个核时，报错。
-- `W <= C`：各 job 的连续 CPU 区间互不重叠，多余的核均匀留在 job 区间之间，让这些区间分散在输入范围内。只有一个 job 时，从 `cpu_start` 开始分配。
-- `W > C`：允许不同 job 复用 CPU 区间，按已分配实例负载选择连续区间，尽量均衡。每个 job 的区间仍连续且长度等于其 numjobs，不越界、不首尾绕回。连续区间约束下不保证每核实例数之差不超过 1。
+- 必须满足 `W <= C`；如果全部 job 需要的核数超过输入范围，生成计划时直接报错，不复用 CPU。
+- 从 `cpu_start` 开始，按 job 顺序连续分配恰好 numjobs 个核，各 job 区间互不重叠。
+- 分配足够的核后立即停止，输入范围内剩余的高编号 CPU 不参与本用例。
 
-例如 CPU `2..17`、4 个 job、每个 numjobs=2，分配为 `2-3`、`6-7`、`11-12`、`16-17`。逐 job 配置的 numjobs 不同时，也分别按各自数量分配连续区间。分配结果保存在 `run_info.json` 的 `cpu_assignments`。
+例如 CPU `1..100`、4 个 job、每个 numjobs=4，需要 16 个核，依次分配为 `1-4`、`5-8`、`9-12`、`13-16`，17-100 不使用。逐 job 配置的 numjobs 不同时，也按各自数量推进起始位置。分配结果保存在 `run_info.json` 的 `cpu_assignments`，并单独写入每个用例目录的 `cpu_binding.json`。
 
 fio 的 split 仍按全局实例序号在该 job 的区间内取模。因此不同 numjobs 的 job 中，clone 0 不一定从区间第一个核开始，但同一个 job 的所有克隆恰好覆盖该 job 的全部分配核。
 
-`cpu_mapping.csv` 是基于 fio split 规则生成的**预期分配**，不是运行时采样结果。当前版本不采集实际 CPU 调度轨迹，不修改 IRQ 亲和性，也不承诺各核 CPU 使用率或 IOPS 相同。按 CPU 编号分散 job 区间并不等价于按 NUMA 或物理核拓扑分散。
+`cpu_mapping.csv` 是基于 fio split 规则生成的**预期分配**，不是运行时采样结果。当前版本不采集实际 CPU 调度轨迹，不修改 IRQ 亲和性，也不承诺各核 CPU 使用率或 IOPS 相同。按 CPU 编号连续分配并不等价于按 NUMA 或物理核拓扑分配。
 
 整个输入闭区间必须在线且属于当前进程可用的 affinity/cpuset；不符合时明确报错，不会静默缩小范围。
 
@@ -249,6 +249,7 @@ fio_results/
     environment.json              # Python/fio 版本和实际设备信息
     001_seq_read_1m/
       jobs.fio                    # 完整 fio job 描述文件
+      cpu_binding.json            # 本用例绑核策略、CPU 总数/清单和逐 job 区间
       cpu_mapping.csv             # 预期实例到 CPU 的对应关系
       cpu.csv                     # 每约 3 秒采集全部逻辑 CPU 的 /proc/stat 指标
       cpu_sampler.log             # CPU 采样器自身输出及异常
@@ -308,9 +309,9 @@ python3.11 fio_result_report.py --results result.txt --output 统计结果.xlsx
 
 报表包含 `统计概览`、`用例覆盖`、`Job配置`、`运行明细` 和 `异常清单`。`用例覆盖` 每个用例一行，前面的配置列与输入 Excel 的 `Cases` 列一一对应，`rw`、`bs`、`iodepth`、`jobs`、`numjobs`、CPU 范围、运行模式等均为独立列，可直接使用 Excel 筛选；执行结果列后面是本用例绑定 CPU 的平均指标，再后面是 fio 性能汇总。多个 job 的某项有效参数完全相同时只显示一个值，不重复拼接；存在差异时显示“多值（见Job配置）”。`Job配置` 每个独立 job 一行，展开 `JobOverrides` 后的有效参数，便于筛选多 job 用例。`运行明细` 保留扫描到的全部历史记录，并给出原始结果和 CPU 采样日志路径。
 
-CPU 汇总优先解析每个用例归档中的 `jobs.fio`，合并所有 job 的有效 `cpus_allowed` 并去重，再从 `cpu.csv` 中只选择对应的 `cpuN` 行。不会使用 Excel 的 `cpu_start..cpu_end` 直接推断，因为为分散 job 而留出的空闲核也位于这个范围内。只有旧归档缺少 `jobs.fio` 时，才回退读取 `run_info.json` 的 `cpu_assignments`。
+CPU 汇总优先解析每个用例归档中的 `jobs.fio`，合并所有 job 的有效 `cpus_allowed` 并去重，再从 `cpu.csv` 中只选择对应的 `cpuN` 行。不会使用 Excel 的完整 `cpu_start..cpu_end` 直接推断，因为范围尾部可能有未使用的核。只有旧归档缺少 `jobs.fio` 时，才回退读取 `run_info.json` 的 `cpu_assignments`。
 
-例如 `jobs.fio` 中四个 job 分别写着 `2-3`、`6-7`、`11-12`、`16-17`，报表只统计这 8 个逻辑 CPU，不会把范围中未绑定的 4、5、8、9、10、13、14、15 算进去。多个 job 重复绑定同一个 CPU 时，该 CPU 只计一次。
+例如 `jobs.fio` 中四个 job 分别写着 `2-3`、`4-5`、`6-7`、`8-9`，报表只统计这 8 个逻辑 CPU，不会把输入范围中 10 及之后未绑定的 CPU 算进去。旧归档若有多个 job 重复绑定同一个 CPU，该 CPU 也只计一次。
 
 CPU 汇总列包括：
 
@@ -441,7 +442,7 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 python3.11 -B -m unittest discover -s tests -v
 ```
 
-本次在 Windows / Python 3.12.14 环境完成 75 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、全部逻辑 CPU 采样、`jobs.fio` 绑定核解析及加权汇总、缺少绑定信息时禁止回退全系统平均、内存/NUMA 采样、系统盘保护、逐 job 连续 CPU 区间、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
+本次在 Windows / Python 3.12.14 环境完成 76 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、全部逻辑 CPU 采样、`jobs.fio` 绑定核解析及加权汇总、缺少绑定信息时禁止回退全系统平均、内存/NUMA 采样、系统盘保护、从起始核连续且不复用的逐 job CPU 分配、独立绑核清单、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
 
 结果统计样例的五张工作表已渲染检查，未发现公式错误或标题截断。尚未在 Python 3.11.6 本机或 Linux/libaio/真实块设备上执行集成测试；目标机正式运行会先进行 fio 参数解析检查。请先在目标机把一个只读用例改为短时长进行环境验证。
 

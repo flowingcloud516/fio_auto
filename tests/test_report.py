@@ -113,7 +113,7 @@ class ReportTests(unittest.TestCase):
     def test_jobs_fio_binding_parser_and_run_info_fallback(self):
         cpus, note = report.cpus_from_jobs_fio(ROOT / "examples" / "example_jobs.fio")
         self.assertEqual(note, "")
-        self.assertEqual(report.compact_cpu_list(cpus), "2-3,6-7,11-12,16-17")
+        self.assertEqual(report.compact_cpu_list(cpus), "2-9")
 
         folder = self.root / "fallback"
         folder.mkdir()
