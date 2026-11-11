@@ -43,6 +43,36 @@ sudo python3.11 fio_excel_runner.py \
 
 若你的解释器命令是 `python3`，先用 `python3 --version` 确认版本，再替换示例命令。`sudo` 下也必须能找到这个解释器。
 
+### 一条命令运行套件并生成结果
+
+`runner_batch.py` 用一个 `case_name` 统一现有两个脚本的 5 个路径参数。假设当前目录存在 `nvme_randread.xlsx`：
+
+```bash
+sudo python3.11 runner_batch.py nvme_randread
+```
+
+该命令按顺序执行：
+
+1. 调用 `fio_excel_runner.py --excel nvme_randread.xlsx --output nvme_randread`。
+2. 调用 `fio_result_report.py --excel nvme_randread.xlsx --results nvme_randread --output nvme_randread_result.xlsx`。
+
+最终目录和文件为：
+
+```text
+nvme_randread.xlsx          # 输入用例
+nvme_randread/              # 所有批次的运行归档
+nvme_randread_result.xlsx   # 汇总报告
+```
+
+runner 的其他参数直接写在 `case_name` 后面，套脚本会原样转发。例如：
+
+```bash
+sudo python3.11 runner_batch.py nvme_randread --allow-write --device /dev/nvme1n1
+python3.11 runner_batch.py nvme_randread --dry-run --device-size-bytes 1000000000000
+```
+
+也可以传入 `nvme_randread.xlsx`，效果与 `nvme_randread` 相同。`--excel` 和 `--output` 已由套脚本统一管理，不能在转发参数中覆盖。结果目录会保留历次运行，报告每次重新扫描整个目录并覆盖同名的 `_result.xlsx`。如果 runner 失败，套脚本仍会汇总已经归档的状态和日志，但最终退出码仍保持 runner 的非零值。
+
 ## Excel 填写方法
 
 ### Cases：每行一个用例
@@ -442,7 +472,7 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 python3.11 -B -m unittest discover -s tests -v
 ```
 
-本次在 Windows / Python 3.12.14 环境完成 76 项自动测试，包括实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、全部逻辑 CPU 采样、`jobs.fio` 绑定核解析及加权汇总、缺少绑定信息时禁止回退全系统平均、内存/NUMA 采样、系统盘保护、从起始核连续且不复用的逐 job CPU 分配、独立绑核清单、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
+本次在 Windows / Python 3.12.14 环境完成 80 项自动测试，包括批量入口的路径推导、参数转发和失败后汇总，实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、全部逻辑 CPU 采样、`jobs.fio` 绑定核解析及加权汇总、缺少绑定信息时禁止回退全系统平均、内存/NUMA 采样、系统盘保护、从起始核连续且不复用的逐 job CPU 分配、独立绑核清单、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
 
 结果统计样例的五张工作表已渲染检查，未发现公式错误或标题截断。尚未在 Python 3.11.6 本机或 Linux/libaio/真实块设备上执行集成测试；目标机正式运行会先进行 fio 参数解析检查。请先在目标机把一个只读用例改为短时长进行环境验证。
 
