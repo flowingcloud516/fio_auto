@@ -12,9 +12,9 @@ import re
 import sys
 import zipfile
 
-from fio_excel_runner import CASE_COLUMNS, ConfigError, load_cases
+from fio_excel_runner import CASE_COLUMNS, ConfigError, format_fio_extra_options, load_cases
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 FINAL_EXECUTED = {"passed", "failed", "timeout", "interrupted", "error"}
 BAD = {"failed", "timeout", "interrupted", "error", "preflight_failed", "skipped", "corrupt"}
 STATUS_CN = {
@@ -27,8 +27,9 @@ STATUS_CN = {
 
 
 def case_signature(case):
-    jobs = [{k: job.get(k) for k in ("job_index", "rw", "bs_bytes", "iodepth", "numjobs", "rwmixread",
-                                             "numa_mem_policy")}
+    jobs = [{**{k: job.get(k) for k in ("job_index", "rw", "bs_bytes", "iodepth", "numjobs",
+                                        "rwmixread", "numa_mem_policy")},
+             "fio_extra_options": sorted((job.get("fio_extra_options") or {}).items())}
             for job in case.get("job_list", [])]
     return {
         "device": case.get("device", case.get("requested_device", "")), "cpu_start": case.get("cpu_start"),
@@ -455,7 +456,9 @@ def build_rows(cases, attempts):
         for job in case["job_list"]:
             job_rows.append([case["case_id"], job["job_index"], job["rw"], job["bs_bytes"],
                              job["iodepth"], job["numjobs"], job["rwmixread"],
-                             job.get("numa_mem_policy") or "", case["cpu_start"], case["cpu_end"],
+                             job.get("numa_mem_policy") or "",
+                             format_fio_extra_options(job.get("fio_extra_options")),
+                             case["cpu_start"], case["cpu_end"],
                              STATUS_CN.get(status, status)])
         if status not in {"passed", "disabled"} or (latest and latest.get("metric_error")):
             exceptions.append([case["case_id"], STATUS_CN.get(status, status), reason,
@@ -493,10 +496,10 @@ CPU_METRIC_KEYS = [
 def overview_row(case, latest, status, reason, run_count, pass_count, history_count):
     source = case.get("source_values", {})
     def compact(key, formatter=lambda value: value):
-        values = {job.get(key) for job in case["job_list"]}
+        values = {"" if job.get(key) is None else formatter(job.get(key))
+                  for job in case["job_list"]}
         if len(values) == 1:
-            value = next(iter(values))
-            return "" if value is None else formatter(value)
+            return next(iter(values))
         return "多值（见Job配置）"
 
     def readable_bs(value):
@@ -510,7 +513,8 @@ def overview_row(case, latest, status, reason, run_count, pass_count, history_co
               compact("numjobs"), case["cpu_start"], case["cpu_end"], case.get("runtime_s"),
               compact("rwmixread"), source.get("notes", ""),
               1 if case.get("time_based", True) else 0, case.get("timeout_s"),
-              compact("numa_mem_policy")]
+              compact("numa_mem_policy"),
+              compact("fio_extra_options", format_fio_extra_options)]
     values = config + [STATUS_CN.get(status, status), reason, run_count, pass_count, history_count,
                        latest.get("batch", "") if latest else "",
                        latest.get("finished_at", "") if latest else ""]
@@ -536,7 +540,7 @@ OVERVIEW_HEADERS = list(CASE_COLUMNS) + ["当前状态", "状态说明", "执行
 DETAIL_HEADERS = ["用例ID", "批次", "状态", "匹配当前配置", "创建时间", "开始时间", "完成时间", "退出码", "原因", "指标说明", "用例目录", "原始结果日志", "CPU采样日志"] + CPU_METRIC_KEYS + METRIC_KEYS
 EXCEPTION_HEADERS = ["用例ID", "状态", "原因", "指标说明", "批次"]
 JOB_HEADERS = ["case_id", "job_index", "rw", "bs_bytes", "iodepth", "numjobs", "rwmixread",
-               "numa_mem_policy", "cpu_start", "cpu_end", "当前状态"]
+               "numa_mem_policy", "fio_extra_options", "cpu_start", "cpu_end", "当前状态"]
 
 
 def col_name(number):

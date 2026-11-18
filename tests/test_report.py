@@ -174,11 +174,19 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(repeated["iodepth"], 32)
         self.assertEqual(repeated["numjobs"], 2)
         self.assertEqual(repeated["numa_mem_policy"], "")
+        self.assertEqual(repeated["fio_extra_options"], "")
 
         custom_index = next(i for i, case in enumerate(cases) if case["case_id"] == "custom_jobs")
         custom = dict(zip(report.OVERVIEW_HEADERS, overview[custom_index]))
         self.assertEqual(custom["rw"], "多值（见Job配置）")
         self.assertEqual(custom["bs"], "多值（见Job配置）")
+        self.assertEqual(custom["fio_extra_options"], "多值（见Job配置）")
+        custom_jobs = [dict(zip(report.JOB_HEADERS, row)) for row in jobs
+                       if row[report.JOB_HEADERS.index("case_id")] == "custom_jobs"]
+        self.assertEqual(custom_jobs[0]["fio_extra_options"],
+                         "iomem=shmhuge;hugepage-size=2m")
+        self.assertEqual(custom_jobs[1]["fio_extra_options"],
+                         "iomem=shmhuge;hugepage-size=2m;rate=500m")
 
     def test_combined_output_json_extraction(self):
         source = self.root / "result.txt"

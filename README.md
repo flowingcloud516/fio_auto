@@ -95,6 +95,7 @@ python3.11 runner_batch.py nvme_randread --dry-run --device-size-bytes 100000000
 | time_based | `1` 按 `runtime_s` 定时运行；`0` 完成规划范围一次后退出；旧 Excel 没有此列时默认 `1` |
 | timeout_s | watchdog 秒数；`time_based=0` 时必须填写；定时用例留空则使用 `runtime_s + --timeout-grace` |
 | numa_mem_policy | 可选的 fio NUMA 内存策略，如 `bind:0`、`prefer:1`、`interleave:0-1`、`local`；留空不设置 |
+| fio_extra_options | 可选的其他 fio 参数，使用分号分隔的 `key=value`；例如 `iomem=shmhuge;hugepage-size=2m` |
 
 `bs` 的 k/m/g 按 1024 换算；生成 job 文件时写为明确的字节数。第一版不支持 `bssplit`、块大小范围或在一个单元格填参数列表。要比较参数，请复制成多行用例。
 
@@ -106,22 +107,24 @@ python3.11 runner_batch.py nvme_randread --dry-run --device-size-bytes 100000000
 sudo python3.11 fio_excel_runner.py --excel 示例.xlsx --device /dev/sdb --dry-run
 ```
 
-旧版 Excel 只要已有 `device` 列即可继续使用；缺少 `time_based`、`timeout_s` 和 `numa_mem_policy` 时自动按原来的定时模式处理，并且不设置 NUMA 内存策略。
+旧版 Excel 只要已有 `device` 列即可继续使用；缺少 `time_based`、`timeout_s`、`numa_mem_policy` 和 `fio_extra_options` 时自动按原来的定时模式处理，并且不设置 NUMA 内存策略或其他 fio 参数。
 
 ### JobOverrides：单独配置某个 job
 
-用 `case_id` 和 `job_index` 指定要覆盖的 job。`job_index` 从 1 开始，不超过该用例的 `jobs`。可覆盖 `rw`、`bs`、`iodepth`、`numjobs`、`rwmixread`、`numa_mem_policy`，空白继承 Cases。
+用 `case_id` 和 `job_index` 指定要覆盖的 job。`job_index` 从 1 开始，不超过该用例的 `jobs`。可覆盖 `rw`、`bs`、`iodepth`、`numjobs`、`rwmixread`、`numa_mem_policy`、`fio_extra_options`，空白继承 Cases。JobOverrides 的其他 fio 参数会在 Cases 默认值上增加或按参数名覆盖。
 
 例如示例中的 `custom_jobs` 生成两个配置段：
 
 - `job_001`：`read`、128 KiB、iodepth 16、numjobs 1。
-- `job_002`：`randwrite`、4 KiB、iodepth 32、numjobs 3。
+- `job_002`：`randwrite`、4 KiB、iodepth 32、numjobs 3，并增加 `rate=500m`。
+
+Cases 为这个禁用示例统一配置了 `iomem=shmhuge;hugepage-size=2m`，因此两个 job 都继承大页参数；只有 job_002 增加限速参数。
 
 该用例共 4 个实例，实际数量为各 job 的 `numjobs` 之和。启用它时，在 Cases 中把 `enabled` 改为 `1`，并为执行添加 `--allow-write`。
 
 `JobOverrides` 可以只保留表头，也可以删除整个工作表。`Guide` 是填写说明，脚本不会读取它。
 
-生成 job 文件时，`rw`、`bs`、`iodepth`、`numjobs` 会分别判断所有独立 job 的最终有效值：某项完全一致时只写入 `[global]`，方便手工调整；某项存在 JobOverrides 差异时，该项写回每个 `[job_xxx]`。`offset`、`size`、`cpus_allowed` 始终保留在具体 job 中。
+生成 job 文件时，`rw`、`bs`、`iodepth`、`numjobs` 和其他 fio 参数会分别判断所有独立 job 的最终有效值：某项完全一致时只写入 `[global]`，方便手工调整；某项存在 JobOverrides 差异时，该项写回具体 `[job_xxx]`。`offset`、`size`、`cpus_allowed` 始终保留在具体 job 中。
 
 ### 输入约束
 
@@ -133,6 +136,34 @@ sudo python3.11 fio_excel_runner.py --excel 示例.xlsx --device /dev/sdb --dry-
 - 仅支持普通、未加密的 `.xlsx`，不支持 `.xls`、`.xlsm`、日期型输入或合并的配置单元格。
 - 禁用行仍检查配置格式；CPU 是否可用只检查本次启用并选中的用例。
 - 重复用例 ID、重复 job 覆盖、未知字段、缺失必要值和非法参数都会报错。
+
+### 其他 fio 参数
+
+`fio_extra_options` 用于不值得单独增加 Excel 列的 fio 长尾参数。一个单元格内使用分号分隔多个 `key=value`，参数值可以包含额外的等号，但不能包含分号、换行或控制字符：
+
+```text
+iomem=shmhuge;hugepage-size=2m;iomem_align=2m;rate=500m
+```
+
+这里填写的是 job 文件语法，不带命令行前缀 `--`。runner 会逐项解析后再写入 `jobs.fio`，不会把单元格原文直接拼接到配置文件；参数名统一转为小写，同一单元格内重名会报错。正式运行前的 fio `--parse-only` 会继续检查当前 fio 版本是否认识这些参数。
+
+为了保留框架的设备、前 84% 范围、绑核、写入授权和进程生命周期保护，框架管理的参数不能从该字段覆盖。主要包括：
+
+- 设备和区域：`filename`、`directory`、`size`、`io_size`、`offset`、`offset_increment`。
+- 核心用例字段：`rw`、`bs`、`iodepth`、`numjobs`、`rwmixread`、`runtime`、`time_based`。
+- CPU/NUMA：`cpus_allowed`、`cpus_allowed_policy`、`numa_mem_policy`。
+- 固定和安全参数：`direct`、`ioengine`、`group_reporting`、`norandommap`、`randrepeat`、`ramp_time`、`allow_file_create`、`exitall_on_error`。
+- 外部命令、回放和删除类：`exec_prerun`、`exec_postrun`、`read_iolog`、`replay_redirect`、`unlink` 等。
+
+命中禁用项时 runner 会指出具体参数并终止配置加载，不会静默忽略。解析后的最终参数同时保存在 `run_info.json` 的各 job 配置中；结果统计的“用例覆盖”和“Job配置”也会单独展示 `fio_extra_options`。
+
+大页示例：
+
+```text
+iomem=shmhuge;hugepage-size=2m
+```
+
+这只负责把参数传给 fio，不会替操作系统预留 HugeTLB 页。运行前仍需确认系统和目标 NUMA node 有足够的对应尺寸空闲大页；否则 fio 会在实际 buffer 分配时失败。
 
 ## 运行和绑核约定
 
@@ -398,6 +429,16 @@ python3.11 fio_case_generator.py \
   --numa-mem-policy bind:0 --output NUMA用例.xlsx
 ```
 
+其他 fio 参数通过 `--fio-extra-options` 写入所有生成用例。Linux shell 会解释分号，因此参数值必须整体引用：
+
+```bash
+python3.11 fio_case_generator.py \
+  --rw randread --bs 4K,128K --iodepth 1,32 \
+  --device /dev/nvme1n1 --cpu-start 0 --cpu-end 31 \
+  --fio-extra-options 'iomem=shmhuge;hugepage-size=2m' \
+  --output 大页用例.xlsx
+```
+
 生成器输出 `Cases` 和空的 `JobOverrides` 两个 sheet，并在写入后调用 runner 自己的 Excel 解析器做一次完整校验。默认最多生成 10000 个用例，可用 `--max-cases` 调整保护上限。对于 `rw`/`randrw`，可用 `--rwmixread` 指定读比例。
 
 生成完整范围用例时关闭定时模式，并显式设置 watchdog：
@@ -472,7 +513,7 @@ python3.11 fio_excel_runner.py --excel 示例.xlsx \
 python3.11 -B -m unittest discover -s tests -v
 ```
 
-本次在 Windows / Python 3.12.14 环境完成 80 项自动测试，包括批量入口的路径推导、参数转发和失败后汇总，实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、无 Excel 原始结果收集、全部逻辑 CPU 采样、`jobs.fio` 绑定核解析及加权汇总、缺少绑定信息时禁止回退全系统平均、内存/NUMA 采样、系统盘保护、从起始核连续且不复用的逐 job CPU 分配、独立绑核清单、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
+本次在 Windows / Python 3.12.14 环境完成 83 项自动测试，包括批量入口的路径推导、参数转发和失败后汇总，实际示例 `.xlsx` 读取、Excel 盘符和命令行覆盖优先级、公共参数自动提升、逐 job 覆盖、安全的其他 fio 参数解析与生成、无 Excel 原始结果收集、全部逻辑 CPU 采样、`jobs.fio` 绑定核解析及加权汇总、缺少绑定信息时禁止回退全系统平均、内存/NUMA 采样、系统盘保护、从起始核连续且不复用的逐 job CPU 分配、独立绑核清单、84% 区域隔离、子进程超时及失败/中断状态等。分区检查覆盖 1、2、3、4、5、7、16、85 个 job 和不同容量，按 fio 的参数规则核算生成文件中的 offset/size。源码额外通过 Python 3.11 语法模式检查，仅使用 3.11 已有标准库 API。
 
 结果统计样例的五张工作表已渲染检查，未发现公式错误或标题截断。尚未在 Python 3.11.6 本机或 Linux/libaio/真实块设备上执行集成测试；目标机正式运行会先进行 fio 参数解析检查。请先在目标机把一个只读用例改为短时长进行环境验证。
 

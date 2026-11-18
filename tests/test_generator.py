@@ -71,6 +71,21 @@ class GeneratorTests(unittest.TestCase):
         self.assertTrue(all(job["numa_mem_policy"] == "bind:1"
                             for case in cases for job in case["job_list"]))
 
+    def test_generic_fio_options_generation(self):
+        output = self.root / "hugepages.xlsx"
+        generator.main(self.base() + [
+            "--fio-extra-options", "IOMEM=shmhuge;hugepage-size=2m",
+            "--output", str(output)])
+        cases = runner.load_cases(output)
+        expected = {"iomem":"shmhuge", "hugepage-size":"2m"}
+        self.assertTrue(all(job["fio_extra_options"] == expected
+                            for case in cases for job in case["job_list"]))
+        self.assertEqual(cases[0]["source_values"]["fio_extra_options"],
+                         "iomem=shmhuge;hugepage-size=2m")
+        with self.assertRaisesRegex(runner.ConfigError, "managed"):
+            generator.main(self.base() + ["--fio-extra-options", "size=100%",
+                                          "--output", str(self.root / "unsafe.xlsx")])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,11 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(self.cases[0]["timeout_s"])
         self.assertEqual(self.cases[1]["total_workers"], 8)
         self.assertEqual(self.cases[0]["requested_device"], "/dev/nvme1n1")
+        custom = next(case for case in self.cases if case["case_id"] == "custom_jobs")
+        self.assertEqual(custom["job_list"][0]["fio_extra_options"],
+                         {"iomem":"shmhuge", "hugepage-size":"2m"})
+        self.assertEqual(custom["job_list"][1]["fio_extra_options"],
+                         {"iomem":"shmhuge", "hugepage-size":"2m", "rate":"500m"})
 
     def test_legacy_workbook_defaults_time_based(self):
         cells = runner.read_xlsx(SAMPLE)
@@ -171,6 +176,37 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([j["numjobs"] for j in custom["job_list"]], [1, 3])
         self.assertEqual([j["rw"] for j in custom["job_list"]], ["read", "randwrite"])
         self.assertEqual([j["iodepth"] for j in custom["job_list"]], [16, 32])
+
+    def test_fio_extra_options_parser_and_safety_boundary(self):
+        options = runner.fio_extra_options(
+            " IOMEM=shmhuge ; hugepage-size=2m ; buffer_pattern=a=b ", "test")
+        self.assertEqual(options, {"iomem":"shmhuge", "hugepage-size":"2m",
+                                   "buffer_pattern":"a=b"})
+        self.assertEqual(runner.format_fio_extra_options(options),
+                         "iomem=shmhuge;hugepage-size=2m;buffer_pattern=a=b")
+        for value in ("filename=/dev/sda", "offset=0", "size=100%", "cpus-allowed=1",
+                      "exec_prerun=touch /tmp/x", "read_iolog=unsafe.log", "rw=write"):
+            with self.subTest(value=value), self.assertRaisesRegex(runner.ConfigError, "managed"):
+                runner.fio_extra_options(value, "test")
+        for value in ("iomem", "=shmhuge", "iomem=", "bad name=value",
+                      "iomem=shmhuge;iomem=malloc", "iomem=shmhuge\nsize=100%"):
+            with self.subTest(value=value), self.assertRaises(runner.ConfigError):
+                runner.fio_extra_options(value, "test")
+
+    def test_fio_extra_options_global_promotion_and_job_override(self):
+        case = next(c for c in self.cases if c["case_id"] == "custom_jobs")
+        plan = runner.make_plan(case, "/dev/test", 10**12, 512)
+        parsed = configparser.ConfigParser(interpolation=None)
+        parsed.read_string(plan["fio_text"])
+        self.assertEqual(parsed["global"]["iomem"], "shmhuge")
+        self.assertEqual(parsed["global"]["hugepage-size"], "2m")
+        self.assertNotIn("rate", parsed["job_001"])
+        self.assertEqual(parsed["job_002"]["rate"], "500m")
+        self.assertEqual(plan["global_extra_options"],
+                         {"iomem":"shmhuge", "hugepage-size":"2m"})
+        self.assertEqual(plan["fio_text"].count("iomem=shmhuge"), 1)
+        self.assertEqual(plan["fio_text"].count("hugepage-size=2m"), 1)
+        self.assertEqual(plan["fio_text"].count("rate=500m"), 1)
 
     def test_cpu_distribution_property(self):
         for start in (0, 2, 251):

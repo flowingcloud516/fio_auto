@@ -25,19 +25,34 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 DISK_RANGE_PERCENT = 84
 CRITICAL_MOUNT_POINTS = {"/", "/boot", "/boot/efi", "/usr", "/var"}
 CASE_BASE_COLUMNS = ("case_id", "enabled", "device", "rw", "bs", "iodepth", "jobs", "numjobs",
                      "cpu_start", "cpu_end", "runtime_s", "rwmixread", "notes")
-CASE_OPTIONAL_COLUMNS = ("time_based", "timeout_s", "numa_mem_policy")
+CASE_OPTIONAL_COLUMNS = ("time_based", "timeout_s", "numa_mem_policy", "fio_extra_options")
 CASE_COLUMNS = CASE_BASE_COLUMNS + CASE_OPTIONAL_COLUMNS
 JOB_BASE_COLUMNS = ("case_id", "job_index", "rw", "bs", "iodepth", "numjobs", "rwmixread", "notes")
-JOB_OPTIONAL_COLUMNS = ("numa_mem_policy",)
+JOB_OPTIONAL_COLUMNS = ("numa_mem_policy", "fio_extra_options")
 JOB_COLUMNS = JOB_BASE_COLUMNS + JOB_OPTIONAL_COLUMNS
 RW = {"read", "write", "randread", "randwrite", "rw", "randrw"}
 FIXED = ("direct=1", "ioengine=libaio", "group_reporting=1", "norandommap=1",
          "randrepeat=0", "ramp_time=0")
+
+# These options are owned by the runner. Allowing them through the generic fio
+# field could bypass the target-device, 84%-range, CPU, write, or lifecycle guards.
+MANAGED_FIO_OPTIONS = frozenset("""
+allow_file_create blocksize bs bsrange bssplit cpumask cpus_allowed cpus_allowed_policy
+create_fsync create_only create_serialize direct directory exec_postrun exec_prerun exitall
+exitall_on_error fallocate file_append file_offset file_size_high file_size_low filename
+filename_format filesize group_reporting include io_size iodepth ioengine loops name new_group
+norandommap nrfiles numa_cpu_nodes numa_mem_policy offset offset_align offset_increment opendir
+openfiles ramp_time randrepeat readonly read_iolog readwrite replay_align replay_no_stall
+replay_redirect replay_scale replay_skip replay_time_scale runtime rw rwmixread rwmixwrite size
+startdelay stonewall time_based timeout truncate unlink unlink_each_loop wait_for
+wait_for_previous write_iolog zone_range zone_size zone_skip zonecapacity zonemode zonerange
+zonesize zoneskip numjobs
+""".split())
 
 
 class ConfigError(ValueError):
@@ -92,6 +107,45 @@ def numa_mem_policy(value, label):
             if len(ends) == 2 and ends[0] > ends[1]:
                 fail(f"{label}: invalid descending NUMA node range {part}")
     return f"{mode}:{nodes}"
+
+
+def fio_extra_options(value, label):
+    """Parse a semicolon-separated list of safe, unmanaged fio key=value options."""
+    if value in (None, ""):
+        return {}
+    text = str(value).strip()
+    if len(text) > 4096:
+        fail(f"{label}: exceeds the 4096-character limit")
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        fail(f"{label}: control characters and line breaks are not allowed")
+    output = {}
+    for item in text.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        name, separator, option_value = item.partition("=")
+        name, option_value = name.strip().lower(), option_value.strip()
+        if not separator or not name or not option_value:
+            fail(f"{label}: each item must be key=value, separated by ';'; got {item!r}")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
+            fail(f"{label}: invalid fio option name {name!r}")
+        if name.replace("-", "_") in MANAGED_FIO_OPTIONS:
+            fail(f"{label}: {name!r} is managed by the framework and cannot be overridden")
+        if name in output:
+            fail(f"{label}: duplicate fio option {name!r}")
+        if len(option_value) > 2048:
+            fail(f"{label}: value for {name!r} exceeds the 2048-character limit")
+        output[name] = option_value
+        if len(output) > 128:
+            fail(f"{label}: more than 128 fio options")
+    if not output:
+        fail(f"{label}: no key=value options found")
+    return output
+
+
+def format_fio_extra_options(options):
+    """Return the canonical Excel/report representation of parsed fio options."""
+    return ";".join(f"{name}={value}" for name, value in (options or {}).items())
 
 
 def read_xlsx(path):
@@ -189,7 +243,9 @@ def effective_job(data, label):
                 rwmixread=integer(mix, f"{label}.rwmixread", minimum=0, maximum=100, default=50)
                 if rw in {"rw", "randrw"} else None,
                 numa_mem_policy=numa_mem_policy(data.get("numa_mem_policy", ""),
-                                                 f"{label}.numa_mem_policy"))
+                                                 f"{label}.numa_mem_policy"),
+                fio_extra_options=fio_extra_options(data.get("fio_extra_options", ""),
+                                                    f"{label}.fio_extra_options"))
 
 
 def load_cases(path):
@@ -239,16 +295,25 @@ def load_cases(path):
                 fail(f"{label}: duplicate override for job {index}")
             case["overrides"][index] = {k: v for k, v in values.items()
                                         if k in ("rw", "bs", "iodepth", "numjobs", "rwmixread",
-                                                 "numa_mem_policy") and v != ""}
+                                                 "numa_mem_policy", "fio_extra_options") and v != ""}
     for case in cases:
         job_list = []
+        default_extra = fio_extra_options(case["defaults"].get("fio_extra_options", ""),
+                                          f"{case['case_id']}.fio_extra_options")
         for index in range(1, case["jobs"] + 1):
             merged = dict(case["defaults"])
             merged.update(case["overrides"].get(index, {}))
             # A non-mixed override must not inherit a mixed default's ratio.
             if merged["rw"].lower() not in {"rw", "randrw"}:
                 merged["rwmixread"] = case["overrides"].get(index, {}).get("rwmixread", "")
-            job_list.append(dict(job_index=index, **effective_job(merged, f"{case['case_id']}.job_{index:03}")))
+            job = effective_job(merged, f"{case['case_id']}.job_{index:03}")
+            effective_extra = dict(default_extra)
+            override_extra = case["overrides"].get(index, {}).get("fio_extra_options")
+            if override_extra is not None:
+                effective_extra.update(fio_extra_options(
+                    override_extra, f"{case['case_id']}.job_{index:03}.fio_extra_options"))
+            job["fio_extra_options"] = effective_extra
+            job_list.append(dict(job_index=index, **job))
         case["job_list"] = job_list
         case["total_workers"] = sum(j["numjobs"] for j in job_list)
         if case["total_workers"] > 65536:
@@ -316,11 +381,17 @@ def make_plan(case, device, capacity, sector):
         values = {job[source] for job in case["job_list"]}
         if len(values) == 1:
             global_job_options[fio_name] = values.pop()
+    job_extra_options = [dict(job.get("fio_extra_options") or {}) for job in case["job_list"]]
+    global_extra_options = dict(job_extra_options[0])
+    for extra_options in job_extra_options[1:]:
+        global_extra_options = {name: value for name, value in global_extra_options.items()
+                                if extra_options.get(name) == value}
     lines = ["; Generated by fio_excel_runner. Independent jobs use disjoint regions.",
              f"; Total disk range: 0%-{DISK_RANGE_PERCENT}%; capacity={capacity} bytes.",
              "; Clones created by numjobs share their parent job's region.",
              "[global]", f"filename={device}", *FIXED, "allow_file_create=0", "exitall_on_error=1"]
     lines += [f"{name}={value}" for name, value in global_job_options.items()]
+    lines += [f"{name}={value}" for name, value in global_extra_options.items()]
     if case["time_based"]:
         lines += ["time_based=1", f"runtime={case['runtime_s']}"]
     lines.append("")
@@ -358,6 +429,8 @@ def make_plan(case, device, capacity, sector):
             lines.append(f"rwmixread={job['rwmixread']}")
         if job.get("numa_mem_policy") is not None:
             lines.append(f"numa_mem_policy={job['numa_mem_policy']}")
+        lines += [f"{option}={value}" for option, value in job_extra_options[index].items()
+                  if global_extra_options.get(option) != value]
         lines.append("")
         for clone in range(job["numjobs"]):
             # fio uses (global thread_number - 1) % cpus_in_mask for split.
@@ -386,6 +459,7 @@ def make_plan(case, device, capacity, sector):
                 region_alignment_bytes=alignment, selected_cpus=cpus, workers=mapping,
                 cpu_binding=cpu_binding,
                 global_job_options=global_job_options,
+                global_extra_options=global_extra_options,
                 estimated_io_buffer_bytes=sum(j["numjobs"] * j["iodepth"] * j["bs_bytes"]
                                               for j in case["job_list"]),
                 estimated_io_buffer_formula="sum(job.numjobs * job.iodepth * job.bs_bytes)",
